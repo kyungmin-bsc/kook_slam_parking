@@ -1,0 +1,121 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded: ~
+  - Class: rviz_common/Tool Properties
+    Name: Tool Properties
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Cell Size: 1
+      Plane Cell Count: 12
+      Reference Frame: map
+    - Class: rviz_default_plugins/Map
+      Name: Map
+      Enabled: true
+      Topic:
+        Value: /map
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+      Color Scheme: map
+    - Class: rviz_default_plugins/LaserScan
+      Name: LaserScan
+      Enabled: true
+      Topic:
+        Value: /scan
+        Reliability Policy: Best Effort
+      Size (m): 0.03
+      Color: 255; 60; 60
+    - Class: rviz_default_plugins/PoseArray
+      Name: AMCL Particles
+      Enabled: true
+      Topic:
+        Value: /particle_cloud
+        Durability Policy: Volatile
+        Reliability Policy: Best Effort
+      Shape: Arrow (Flat)
+      Color: 0; 200; 255
+    - Class: rviz_default_plugins/Path
+      Name: Nav2 Global Path
+      Enabled: true
+      Topic:
+        Value: /plan
+      Color: 0; 255; 0
+      Line Style: Lines
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Active Route
+      Enabled: true
+      Topic:
+        Value: /parking/route_markers
+        Durability Policy: Transient Local
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Parking Maneuver (color)
+      Enabled: true
+      Topic:
+        Value: /parking/maneuver_markers
+        Durability Policy: Transient Local
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Unmapped Obstacles
+      Enabled: true
+      Topic:
+        Value: /obstacles/markers
+        Durability Policy: Volatile
+    - Class: rviz_default_plugins/Map
+      Name: Local Costmap
+      Enabled: true
+      Topic:
+        Value: /local_costmap/costmap
+        Durability Policy: Transient Local
+      Color Scheme: costmap
+      Alpha: 0.45
+    - Class: rviz_default_plugins/Path
+      Name: Parking Maneuver (raw)
+      Enabled: false
+      Topic:
+        Value: /parking/planned_path
+        Durability Policy: Transient Local
+      Color: 255; 170; 0
+      Line Style: Lines
+    - Class: rviz_default_plugins/Polygon
+      Name: Footprint
+      Enabled: true
+      Topic:
+        Value: /local_costmap/published_footprint
+      Color: 255; 255; 0
+    - Class: rviz_default_plugins/Map
+      Name: Global Costmap
+      Enabled: false
+      Topic:
+        Value: /global_costmap/costmap
+        Durability Policy: Transient Local
+      Color Scheme: costmap
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: false
+      Show Names: true
+  Global Options:
+    Fixed Frame: map
+    Background Color: 48; 48; 48
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/SetInitialPose
+      Topic:
+        Value: /initialpose
+    - Class: rviz_default_plugins/SetGoal
+      Topic:
+        Value: /goal_pose
+  Views:
+    Current:
+      Class: rviz_default_plugins/TopDownOrtho
+      Name: TopDown
+      Target Frame: map
+      Scale: 90
+      X: 1.4
+      Y: 2.6
+Window Geometry:
+  Height: 900
+  Width: 1200
