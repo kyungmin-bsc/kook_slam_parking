@@ -71,6 +71,9 @@ class PassResult:
     tightest_at: Optional[Tuple[float, float]] = None
     blocked_at: Optional[Tuple[float, float]] = None
     detour: float = 0.0                   # 중심선에서 최대 얼마나 비켜야 하는가 (m)
+    # 실제로 지나갈 수 있는 길 (world 좌표). 장애물을 비켜가는 모습을 그대로
+    # 담고 있어 시각화와 시뮬레이션에 쓴다.
+    path: List[Tuple[float, float]] = field(default_factory=list)
 
     def describe(self) -> str:
         if self.passable:
@@ -332,7 +335,10 @@ class PassabilityGrid:
             wx, wy = info.to_world(cx, cy)
             detour = max(detour, self._dist_to_polyline(wx, wy, polyline))
 
-        return PassResult(True, '통과 가능', tightest, at, detour=detour)
+        world = [tuple(round(v, 3) for v in info.to_world(cx, cy))
+                 for cx, cy in path]
+        return PassResult(True, '통과 가능', tightest, at,
+                          detour=detour, path=world)
 
     @staticmethod
     def _dist_to_polyline(x, y, polyline) -> float:

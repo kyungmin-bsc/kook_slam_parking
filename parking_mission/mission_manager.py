@@ -388,6 +388,15 @@ class ParkStep(Step):
             return FAILED
         st = mgr.executor_.state
         if st == EX_FAILED:
+            # 본 기동이 중단됐으면 주차 자체가 안 된 것이라 실패다.
+            # 하지만 '보정' 기동이 중단된 거라면 이야기가 다르다. 이미 슬롯 안에
+            # 들어가 있고 다듬는 중이었을 뿐이므로, 조금 삐뚤어진 채로 끝내는 게
+            # 미션 전체를 포기하는 것보다 낫다. (초음파가 벽을 잡고 멈추는 건
+            # 정상 동작이고, 그때마다 미션이 죽으면 안 된다)
+            if self._corrections > 0:
+                mgr.log('  보정 %d회차가 중단됨 - 현 위치로 주차 종료'
+                        % self._corrections)
+                return DONE
             return FAILED
         if st != EX_DONE:
             return RUNNING

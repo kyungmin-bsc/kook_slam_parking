@@ -84,12 +84,23 @@ SWAP_SIDES = False
 class GuardConfig:
     """후진 안전 감시 설정. 전부 ROS 파라미터로 덮어쓸 수 있다."""
 
-    unit_to_m: float = 0.01      # 센서 값 단위 -> m (HC-SR04 노드는 cm)
+    unit_to_m: float = 0.01      # 센서 값 단위 -> m. 실차 확인 완료: cm
     min_valid: float = 0.02      # HC-SR04 최소 측정거리. 이하는 무효
-    max_valid: float = 2.00      # 이 이상은 신뢰하지 않음 (스펙 4m지만 실용 2m)
+    # xycar_ultrasonic.cpp가 140을 넘는 값을 0으로 만든다.
+    #   if (value < 0 || value > 140) { value = 0; }
+    # 그래서 140cm가 이 드라이버로 얻을 수 있는 최대다. 200 같은 값을 기대하면
+    # 안 된다(뷰어는 >=200을 INF로 표시하지만 그 값은 영원히 오지 않는다).
+    max_valid: float = 1.40
 
-    stop_distance: float = 0.25  # 후방이 이보다 가까우면 정지
-    slow_distance: float = 0.40  # 이보다 가까우면 감속
+    # 실측 근거: 지도에 기동 궤적을 얹고 후방 3개 센서의 원뿔 빔(+-15도)을
+    # 광선 추적해서 잰 값이다.
+    #   A구역 T자 후진 - 후진 중 후방 최소 47cm
+    #   B구역 평행주차 - 후진 중 후방 최소 53cm
+    # 정상 기동에서는 25cm에 닿지 않는다. 여기서 정지가 걸리면 지도에 없는
+    # 진짜 장애물이다.
+    stop_distance: float = 0.25
+    # 40cm로 두면 A구역 막바지(47cm)를 스치며 불필요하게 감속한다.
+    slow_distance: float = 0.35
     side_warn: float = 0.12      # 측면이 이보다 가까우면 경고 (정지는 안 함)
 
     confirm_hits: int = 2        # 연속 몇 번 임계 이하여야 정지로 확정
@@ -125,17 +136,22 @@ class UltrasonicGuard:
         self._bad_hits = 0
         self._good_hits = 0
         self._holding = False
-        self.short_array_seen = False
+        self._short_count = 0
 
     # -- 입력 --------------------------------------------------------------
 
     def feed(self, raw: Sequence[int], stamp: float) -> None:
         """/xycar_ultrasonic 배열을 넣는다. 단위 변환과 유효성 판정을 여기서 한다."""
         if len(raw) < MIN_ARRAY_LEN:
-            # ch7까지 못 읽는다. 값을 갱신하지 않으므로 곧 stale이 되어 정지한다.
-            self.short_array_seen = True
+            # ch7까지 못 읽는 배열이다. 드라이버가 시리얼을 라인 경계 없이 읽어서
+            # 토큰이 8개 미만으로 잡히면 msg.data가 짧게 나올 수 있다.
+            #
+            # 이걸 즉시 '후진 차단'으로 다루면 간헐적인 짧은 읽기마다 후진이
+            # 툭툭 끊긴다. 그래서 '이번 갱신은 무시'로 처리하고, 계속 짧게만
+            # 들어오면 stale 타이머가 잡도록 둔다.
+            self._short_count += 1
             return
-        self.short_array_seen = False
+        self._short_count = 0
         for ch in ALL_CHANNELS:
             self._values[ch] = self._to_meters(raw[ch])
         self._last_stamp = stamp
@@ -191,12 +207,6 @@ class UltrasonicGuard:
         if direction >= 0:
             return GuardVerdict(True, False, '전진 - 초음파 감시 대상 아님')
 
-        if self.short_array_seen:
-            return GuardVerdict(
-                False, False,
-                '초음파 배열이 %d개 미만 - ultra_node를 num_sensors:=8로 실행할 것'
-                % MIN_ARRAY_LEN)
-
         if self._last_stamp is None:
             return GuardVerdict(False, False, '초음파 미수신 - 후진 금지')
         age = now - self._last_stamp
@@ -206,10 +216,14 @@ class UltrasonicGuard:
 
         rear = self.rear_min()
         if rear is None:
-            # 유효값이 하나도 없다. 에코 없음은 '비어 있다'가 아니라 '모른다'다.
-            # 다만 매끈한 벽에서는 정상적으로도 에코가 없을 수 있어, 여기서
-            # 정지시키면 주차 자체가 불가능해진다. 진행하되 감속한다.
-            return GuardVerdict(True, True, '후방 유효값 없음 - 감속 진행', None)
+            # 세 센서가 전부 0이다. 이 드라이버에서는 흔한 정상 상황이다 -
+            # 140cm를 넘으면 0이 되므로, 뒤가 1.4m 넘게 비어 있으면 전부 0이다.
+            # (실제로 B구역 평행주차 후진 구간의 22%가 여기 해당한다)
+            #
+            # 그러니 이걸 이상 상황으로 보고 감속하면 정상 주행을 계속 방해한다.
+            # 원칙은 그대로다 - 0을 '비어 있음'으로 확신하는 게 아니라, 정지시킬
+            # 근거가 없으니 라이다/costmap에 맡기고 진행하는 것이다.
+            return GuardVerdict(True, False, '후방 1.4m 밖 (정상)', None)
 
         if rear <= c.stop_distance:
             self._bad_hits += 1
@@ -262,7 +276,7 @@ if __name__ == '__main__':
 
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
-    def arr(left=200, right=200, rl=200, rc=200, rr=200):
+    def arr(left=120, right=120, rl=120, rc=120, rr=120):
         """8칸 배열 생성. 값은 cm."""
         a = [0] * 8
         a[CH_LEFT] = left
@@ -281,8 +295,8 @@ if __name__ == '__main__':
     ok = True
     print('== 정상 후진 ==')
     g = UltrasonicGuard()
-    g.feed(arr(), 0.0)
-    ok &= show('후방 2.0m', g.check(-1, 0.05), True)
+    g.feed(arr(rc=120), 0.0)
+    ok &= show('후방 1.20m', g.check(-1, 0.05), True)
 
     print()
     print('== 전진은 감시 대상 아님 ==')
@@ -299,11 +313,11 @@ if __name__ == '__main__':
     print()
     print('== 단발 스파이크는 무시 ==')
     g = UltrasonicGuard()
-    g.feed(arr(rc=200), 0.0)
+    g.feed(arr(rc=120), 0.0)
     g.check(-1, 0.01)
     g.feed(arr(rc=15), 0.1)
     ok &= show('스파이크 1회', g.check(-1, 0.11), True)
-    g.feed(arr(rc=200), 0.2)
+    g.feed(arr(rc=120), 0.2)
     ok &= show('복귀', g.check(-1, 0.21), True)
 
     print()
@@ -312,9 +326,9 @@ if __name__ == '__main__':
     for t in (0.0, 0.1):
         g.feed(arr(rc=18), t)
         g.check(-1, t + 0.01)
-    g.feed(arr(rc=200), 0.2)
+    g.feed(arr(rc=120), 0.2)
     ok &= show('해제 1회차 (아직 정지)', g.check(-1, 0.21), False)
-    g.feed(arr(rc=200), 0.3)
+    g.feed(arr(rc=120), 0.3)
     ok &= show('해제 2회차 -> 재개', g.check(-1, 0.31), True)
 
     print()
@@ -322,20 +336,31 @@ if __name__ == '__main__':
     g = UltrasonicGuard()
     ok &= show('미수신', g.check(-1, 0.0), False)
     g = UltrasonicGuard()
-    g.feed(arr(), 0.0)
+    g.feed(arr(rc=100), 0.0)
     ok &= show('0.9s 갱신 없음', g.check(-1, 0.9), False)
     g = UltrasonicGuard()
-    g.feed([100, 100, 100, 100], 0.0)     # num_sensors=4로 뜬 경우
-    ok &= show('배열 4칸 (후방 잘림)', g.check(-1, 0.05), False)
+    g.feed([100, 100, 100, 100], 0.0)     # 짧은 배열 - 갱신 무시
+    ok &= show('배열 4칸 직후 (미수신 상태)', g.check(-1, 0.05), False)
+    g = UltrasonicGuard()
+    g.feed(arr(rc=100), 0.0)              # 정상 1회
+    g.feed([100, 100], 0.1)               # 짧은 배열 끼어듦 -> 무시
+    ok &= show('정상 후 짧은 배열 끼어듦', g.check(-1, 0.15), True)
 
     print()
-    print('== 0값은 "없음"이 아니라 "무효" ==')
+    print('== 후방 전부 0 = 1.4m 밖 (드라이버가 140 초과를 0으로 만듦) ==')
     g = UltrasonicGuard()
     g.feed(arr(rl=0, rc=0, rr=0), 0.0)
     v = g.check(-1, 0.05)
-    ok &= show('후방 전부 0 -> 감속 진행', v, True)
-    print('        (에코 없음을 "비어 있다"로 읽지 않는다. 매끈한 벽은 정상적으로도')
-    print('         반사가 안 오므로 여기서 멈추면 주차 자체가 불가능해진다)')
+    ok &= show('후방 전부 0 -> 정상 진행', v, True)
+    print('        slow=%s (감속하면 안 된다 - 흔한 정상 상황이다)' % v.slow)
+    ok &= (v.slow is False)
+
+    print()
+    print('== 140 초과값은 애초에 오지 않지만, 와도 무효 처리 ==')
+    g = UltrasonicGuard()
+    g.feed(arr(rc=180), 0.0)
+    v = g.check(-1, 0.05)
+    ok &= show('rc=180 -> 무효', v, True)
 
     print()
     print('== 측면 경고 ==')
