@@ -34,6 +34,7 @@ from .geometry import Prim, wrap_angle
 IDLE = 'IDLE'
 PRE_STEER = 'PRE_STEER'
 DRIVING = 'DRIVING'
+HOLD = 'HOLD'          # 초음파가 후방 장애물을 잡아 정지 대기 중
 SETTLE = 'SETTLE'
 DONE = 'DONE'
 FAILED = 'FAILED'
@@ -60,6 +61,12 @@ class MotionConfig:
     # 잡아 조향을 더 세게 준다. 현장 캘리브레이션용.
     radius_scale: float = 1.0
 
+    # 초음파가 후방 장애물을 잡았을 때 이만큼 기다려본다. 사람이 지나가는 등
+    # 일시적인 경우가 있으므로 즉시 포기하지 않는다. 넘기면 기동을 중단한다.
+    hold_timeout: float = 6.0
+    # 감속 시 속도 배율 (초음파가 slow_distance 안쪽을 볼 때)
+    slow_factor: float = 0.5
+
 
 class ManeuverExecutor:
     """Prim 리스트를 순차 실행하는 비차단 상태기계.
@@ -76,11 +83,20 @@ class ManeuverExecutor:
                  cfg: MotionConfig,
                  publish_motor: Callable[[float, float], None],
                  now_sec: Callable[[], float],
-                 log: Callable[[str], None]):
+                 log: Callable[[str], None],
+                 safety: Optional[Callable[[int, float], object]] = None):
+        """safety: (direction, now) -> GuardVerdict 형태의 콜러블.
+
+        None이면 안전 감시 없이 동작한다(시뮬레이션/기하 테스트용). 실차에서는
+        mission_manager가 UltrasonicGuard.check을 넘겨준다.
+        """
         self.cfg = cfg
         self._publish = publish_motor
         self._now = now_sec
         self._log = log
+        self._safety = safety
+        self._hold_since = 0.0
+        self._hold_reason = ''
 
         self.state = IDLE
         self._prims: List[Prim] = []
@@ -164,6 +180,21 @@ class ManeuverExecutor:
                 self._reset_seg()
             return
 
+        if self.state == HOLD:
+            self._publish(steer, 0.0)
+            verdict = self._safety(prim.direction, now) if self._safety else None
+            if verdict is None or verdict.safe:
+                held = now - self._hold_since
+                self._log('  후방 안전 확보 (%.1fs 대기) - 재개' % held)
+                self.state = DRIVING
+                # 대기 중 멈춰 있었으므로 구간 타임아웃 기준을 밀어준다
+                self._t_mark += held
+                return
+            if now - self._hold_since > self.cfg.hold_timeout:
+                self.abort('후방 장애물이 %.0fs간 유지됨 (%s)'
+                           % (self.cfg.hold_timeout, self._hold_reason))
+            return
+
         if self.state == SETTLE:
             self._publish(0.0, 0.0)
             if now - self._t_mark >= self.cfg.settle_time:
@@ -184,6 +215,19 @@ class ManeuverExecutor:
                        % (self._idx, self.cfg.segment_timeout))
             return
 
+        # 초음파 후방 감시. 후진 구간에서만 실제로 작동한다.
+        slow = False
+        if self._safety is not None:
+            verdict = self._safety(prim.direction, now)
+            if not verdict.safe:
+                self._hold_since = now
+                self._hold_reason = verdict.describe()
+                self._log('  정지: %s' % self._hold_reason)
+                self._publish(steer, 0.0)
+                self.state = HOLD
+                return
+            slow = bool(getattr(verdict, 'slow', False))
+
         if self._segment_finished(prim):
             self._publish(steer, 0.0)
             self._log('  구간 %d 종료: 이동 %.3fm, yaw %.1fdeg (목표 %.3fm / %.1fdeg)'
@@ -193,7 +237,13 @@ class ManeuverExecutor:
             self._t_mark = now
             return
 
-        self._publish(steer, self.speed_units(prim.direction))
+        speed = self.speed_units(prim.direction)
+        if slow:
+            reduced = speed * self.cfg.slow_factor
+            # 감속하더라도 정지마찰을 넘는 최소 속도는 유지해야 굴러간다
+            floor = self.cfg.min_move_speed
+            speed = math.copysign(max(abs(reduced), floor), speed)
+        self._publish(steer, speed)
 
     def _accumulate(self, odom) -> None:
         if self._last_xy is None:

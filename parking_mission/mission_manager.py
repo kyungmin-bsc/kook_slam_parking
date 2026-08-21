@@ -50,7 +50,7 @@ from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
-from std_msgs.msg import Bool, Float32MultiArray
+from std_msgs.msg import Bool, Float32MultiArray, Int32MultiArray
 from visualization_msgs.msg import MarkerArray
 from tf2_ros import Buffer, TransformListener
 
@@ -74,6 +74,7 @@ from .motion import FAILED as EX_FAILED
 from .motion import ManeuverExecutor, MotionConfig
 from . import viz
 from .passability import GridInfo, PassabilityGrid, remaining_polyline
+from .ultrasonic import GuardConfig, UltrasonicGuard
 
 RUNNING, DONE, FAILED = 'RUNNING', 'DONE', 'FAILED'
 
@@ -495,6 +496,12 @@ class MissionManager(Node):
         self.declare_parameter('map_topic', '/map')
         self.declare_parameter('obstacle_grid_topic', '/obstacles/grid')
 
+        # 초음파 후방 감시
+        self.declare_parameter('ultrasonic_topic', '/xycar_ultrasonic')
+        self.declare_parameter('use_ultrasonic', True)
+        self.declare_parameter('ultra_stop_distance', 0.25)
+        self.declare_parameter('ultra_slow_distance', 0.40)
+
         # 기동 튜닝값 (motion.MotionConfig 기본값을 파라미터로 덮어쓸 수 있게)
         self.declare_parameter('park_speed', 0.30)
         self.declare_parameter('pre_steer_time', 0.5)
@@ -528,6 +535,16 @@ class MissionManager(Node):
             OccupancyGrid, self.get_parameter('obstacle_grid_topic').value,
             self._on_obs_grid, latched_qos())
 
+        self._use_ultra = bool(self.get_parameter('use_ultrasonic').value)
+        self.guard = UltrasonicGuard(GuardConfig(
+            stop_distance=float(self.get_parameter('ultra_stop_distance').value),
+            slow_distance=float(self.get_parameter('ultra_slow_distance').value),
+        ))
+        if self._use_ultra:
+            self.create_subscription(
+                Int32MultiArray, self.get_parameter('ultrasonic_topic').value,
+                self._on_ultra, 10)
+
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
 
@@ -545,7 +562,8 @@ class MissionManager(Node):
             radius_scale=float(self.get_parameter('radius_scale').value),
         )
         self.executor_ = ManeuverExecutor(
-            mcfg, self.publish_motor, self.now, self.log)
+            mcfg, self.publish_motor, self.now, self.log,
+            safety=self.ultra_check if self._use_ultra else None)
 
         self._steps: List[Step] = self._build_steps()
         self._idx = -1
@@ -608,6 +626,22 @@ class MissionManager(Node):
             msg.pose.pose.position.y,
             yaw_from_quat(msg.pose.pose.orientation),
         )
+
+    def _on_ultra(self, msg: Int32MultiArray) -> None:
+        self.guard.feed(list(msg.data), self.now())
+
+    def ultra_check(self, direction: int, now: float):
+        """ManeuverExecutor가 매 tick 부르는 안전 판정.
+
+        후진 구간에서만 실제로 작동한다. 전진은 초음파가 앞에 없으므로
+        라이다/costmap이 맡는다.
+        """
+        v = self.guard.check(direction, now)
+        warn = self.guard.side_warning()
+        if warn:
+            self.get_logger().warn('측면 근접: %s' % warn,
+                                   throttle_duration_sec=2.0)
+        return v
 
     def _on_map(self, msg: OccupancyGrid) -> None:
         self._static_map = msg
