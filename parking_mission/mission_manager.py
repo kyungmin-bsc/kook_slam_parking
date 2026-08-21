@@ -46,7 +46,7 @@ import rclpy
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PoseStamped
 from nav2_msgs.action import NavigateToPose
-from nav_msgs.msg import Odometry, Path
+from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
@@ -73,6 +73,7 @@ from .motion import DONE as EX_DONE
 from .motion import FAILED as EX_FAILED
 from .motion import ManeuverExecutor, MotionConfig
 from . import viz
+from .passability import GridInfo, PassabilityGrid, remaining_polyline
 
 RUNNING, DONE, FAILED = 'RUNNING', 'DONE', 'FAILED'
 
@@ -119,13 +120,22 @@ class Step:
 class LegStep(Step):
     """한 이동 구간. 여러 경로를 우선순위대로 시도하고, 각 경로는 경유점을 순서대로 통과.
 
-    실패 처리가 두 겹이다.
-      - 경유점 하나가 실패 -> 그 경로의 max_attempts만큼 그 경유점부터 재시도
-      - 재시도를 다 써도 안 되면 -> 그 경로를 포기하고 다음 우선순위 경로로
+    경로를 포기하는 계기가 세 가지다.
+
+      1. 선제 판정 - 경로를 시작하기 전에, 지도 + 실시간 감지 장애물로 그 경로가
+         아직 뚫려 있는지 본다. 막혀 있으면 아예 출발하지 않고 다음 순위로 간다.
+      2. 주행 중 감시 - 가는 도중 새 장애물이 나타나면 남은 경로를 다시 판정한다.
+         비켜서 지나갈 수 있으면 그대로 두고(Nav2가 알아서 피한다), 통과 폭이
+         안 나오면 목표를 취소하고 다음 순위로 전환한다.
+      3. Nav2 경로생성/추종 실패 - max_attempts만큼 재시도 후 다음 순위로.
+
+    2번이 핵심이다. 이게 없으면 막힌 통로로 끝까지 밀고 들어갔다가 좁은 데서
+    오도가도 못하게 된다. 반대로 장애물만 보이면 무조건 우회하면 지나갈 수 있는
+    길을 버리게 되므로, '피해서 갈 수 있는가'를 실제로 계산해서 가른다.
 
     다음 경로로 넘어갈 때 차를 되돌리는 별도 동작은 하지 않는다. Nav2가 현재
-    위치에서 새 경로의 첫 경유점까지 알아서 계획하기 때문이다. 통로 중간에서
-    막혀 멈췄더라도 거기서부터 다른 통로 입구로 빠져나가는 경로가 나온다.
+    위치에서 새 경로의 첫 경유점까지 알아서 계획하고, 플래너가 REEDS_SHEPP이라
+    필요하면 후진해서 빠져나온다.
     """
 
     def __init__(self, leg: cfg.Leg):
@@ -137,25 +147,47 @@ class LegStep(Step):
         self._goal_future = None
         self._result_future = None
         self._goal_handle = None
+        self._next_check = 0.0    # 다음 통행 판정 시각
+        self._blocked_hits = 0    # 연속 '막힘' 판정 횟수 (스파이크 방지)
+        self._cancelling = False
 
     # -- 진입 --------------------------------------------------------------
 
     def enter(self, mgr: 'MissionManager') -> None:
         mgr.set_nav_enabled(True)
         self._ri = 0
-        self._start_route(mgr)
+        self._entered = self._start_route(mgr)
 
-    def _start_route(self, mgr: 'MissionManager') -> None:
-        route = self.leg.routes[self._ri]
-        self._wi = 0
-        self._tries = 0
-        mgr.log('  경로 %d/%d "%s" 시작 (경유 %d점, 실측 마진 %.2fm)'
-                % (self._ri + 1, len(self.leg.routes), route.name,
-                   len(route.waypoints), route.margin))
-        if route.note:
-            mgr.log('    %s' % route.note)
-        mgr.publish_route(route, self._ri)
-        self._send(mgr)
+    def _start_route(self, mgr: 'MissionManager') -> str:
+        """이 경로를 시작한다. 선제 판정에서 막혀 있으면 다음 순위로 넘긴다."""
+        while self._ri < len(self.leg.routes):
+            route = self.leg.routes[self._ri]
+            self._wi = 0
+            self._tries = 0
+            self._blocked_hits = 0
+            self._cancelling = False
+            self._next_check = mgr.now() + mgr.check_period
+
+            verdict = mgr.check_route(route, 0)
+            if verdict is not None and not verdict.passable:
+                mgr.log('  경로 "%s" 선제 판정: %s -> 건너뜀'
+                        % (route.name, verdict.describe()))
+                self._ri += 1
+                continue
+
+            mgr.log('  경로 %d/%d "%s" 시작 (경유 %d점, 실측 마진 %.2fm)'
+                    % (self._ri + 1, len(self.leg.routes), route.name,
+                       len(route.waypoints), route.margin))
+            if verdict is not None:
+                mgr.log('    통행 판정: %s' % verdict.describe())
+            if route.note:
+                mgr.log('    %s' % route.note)
+            mgr.publish_route(route, self._ri)
+            self._send(mgr)
+            return RUNNING
+
+        mgr.log('  모든 경로가 막힘. 이 구간을 통과할 길이 없음')
+        return FAILED
 
     # -- 목표 전송 ----------------------------------------------------------
 
@@ -181,6 +213,40 @@ class LegStep(Step):
     # -- 매 tick -----------------------------------------------------------
 
     def update(self, mgr: 'MissionManager') -> str:
+        if getattr(self, '_entered', RUNNING) == FAILED:
+            return FAILED
+
+        # 목표 취소를 요청해둔 상태면 취소가 끝나기를 기다렸다가 경로를 바꾼다
+        if self._cancelling:
+            if self._result_future is not None and not self._result_future.done():
+                return RUNNING
+            self._cancelling = False
+            self._result_future = None
+            self._goal_handle = None
+            return self._switch_route(mgr, '통과 불가 판정')
+
+        # 주행 중 통행 감시
+        if self._goal_handle is not None and mgr.now() >= self._next_check:
+            self._next_check = mgr.now() + mgr.check_period
+            route = self.leg.routes[self._ri]
+            verdict = mgr.check_route(route, self._wi)
+            if verdict is not None and not verdict.passable:
+                self._blocked_hits += 1
+                mgr.log('    통행 감시: %s (%d/%d)'
+                        % (verdict.describe(), self._blocked_hits,
+                           mgr.blocked_confirm))
+                if self._blocked_hits >= mgr.blocked_confirm:
+                    mgr.log('  "%s" 경로가 막힌 것으로 확정. 목표 취소 후 전환'
+                            % route.name)
+                    self._cancelling = True
+                    if self._goal_handle is not None:
+                        self._goal_handle.cancel_goal_async()
+                    return RUNNING
+            else:
+                if self._blocked_hits and verdict is not None:
+                    mgr.log('    통행 감시: 회복 - %s' % verdict.describe())
+                self._blocked_hits = 0
+
         # 액션 서버가 아직 없어 못 보낸 상태
         if self._goal_future is None and self._goal_handle is None:
             if mgr.nav_client.wait_for_server(timeout_sec=0.0):
@@ -230,6 +296,7 @@ class LegStep(Step):
             return DONE
         # 다음 경유점으로. 재시도 카운터는 경유점마다 새로 준다.
         self._tries = 0
+        self._blocked_hits = 0
         self._send(mgr)
         return RUNNING
 
@@ -241,15 +308,17 @@ class LegStep(Step):
             self._send(mgr)
             return RUNNING
 
-        mgr.log('  "%s" 경로 포기 (경유점 %d에서 %d회 실패)'
-                % (route.name, self._wi + 1, self._tries))
+        return self._switch_route(
+            mgr, '경유점 %d에서 %d회 실패' % (self._wi + 1, self._tries))
+
+    def _switch_route(self, mgr: 'MissionManager', why: str) -> str:
+        route = self.leg.routes[self._ri]
+        mgr.log('  "%s" 경로 포기 (%s)' % (route.name, why))
         self._ri += 1
         if self._ri >= len(self.leg.routes):
             mgr.log('  모든 경로 실패. 통로가 전부 막혔거나 위치추정이 어긋남')
             return FAILED
-        mgr.log('  다음 우선순위 경로로 전환')
-        self._start_route(mgr)
-        return RUNNING
+        return self._start_route(mgr)
 
 
 class ParkStep(Step):
@@ -418,6 +487,14 @@ class MissionManager(Node):
         self.declare_parameter('autostart', False)
         self.declare_parameter('tick_hz', 20.0)
 
+        # 통행 감시
+        self.declare_parameter('check_period', 1.0)      # 판정 주기 (s)
+        self.declare_parameter('blocked_confirm', 2)     # 연속 몇 번 막혀야 확정
+        self.declare_parameter('pass_margin', 0.07)      # 반폭에 더할 여유 (m)
+        self.declare_parameter('pass_band', 0.75)        # 중심선에서 허용 이탈 (m)
+        self.declare_parameter('map_topic', '/map')
+        self.declare_parameter('obstacle_grid_topic', '/obstacles/grid')
+
         # 기동 튜닝값 (motion.MotionConfig 기본값을 파라미터로 덮어쓸 수 있게)
         self.declare_parameter('park_speed', 0.30)
         self.declare_parameter('pre_steer_time', 0.5)
@@ -436,6 +513,20 @@ class MissionManager(Node):
         self._route_pub = self.create_publisher(
             MarkerArray, '/parking/route_markers', latched_qos())
         self.create_subscription(Odometry, odom_topic, self._on_odom, 20)
+
+        self.check_period = float(self.get_parameter('check_period').value)
+        self.blocked_confirm = int(self.get_parameter('blocked_confirm').value)
+        self._pass_margin = float(self.get_parameter('pass_margin').value)
+        self._pass_band = float(self.get_parameter('pass_band').value)
+
+        self._static_map: Optional[OccupancyGrid] = None
+        self._obs_grid: Optional[OccupancyGrid] = None
+        self.create_subscription(
+            OccupancyGrid, self.get_parameter('map_topic').value,
+            self._on_map, latched_qos())
+        self.create_subscription(
+            OccupancyGrid, self.get_parameter('obstacle_grid_topic').value,
+            self._on_obs_grid, latched_qos())
 
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
@@ -517,6 +608,46 @@ class MissionManager(Node):
             msg.pose.pose.position.y,
             yaw_from_quat(msg.pose.pose.orientation),
         )
+
+    def _on_map(self, msg: OccupancyGrid) -> None:
+        self._static_map = msg
+        self.log('정적 지도 수신: %dx%d @ %.3fm'
+                 % (msg.info.width, msg.info.height, msg.info.resolution))
+
+    def _on_obs_grid(self, msg: OccupancyGrid) -> None:
+        self._obs_grid = msg
+
+    def check_route(self, route, from_index: int):
+        """이 경로의 남은 구간이 아직 통과 가능한가.
+
+        정적 지도(/map)와 실시간 감지 장애물(/obstacles/grid)을 겹쳐서 판정한다.
+        지도를 아직 못 받았으면 None을 돌려주고, 호출한 쪽은 판정을 건너뛴다
+        (지도가 없다는 이유로 경로를 포기하면 안 된다).
+        """
+        if self._static_map is None:
+            return None
+        cur = self.map_pose()
+        if cur is None:
+            return None
+
+        m = self._static_map
+        info = GridInfo(m.info.width, m.info.height, m.info.resolution,
+                        m.info.origin.position.x, m.info.origin.position.y)
+        grid = PassabilityGrid.from_arrays(info, m.data)
+
+        if self._obs_grid is not None and self._obs_grid.info.width == info.width:
+            w = info.width
+            grid.add_obstacle_cells(
+                (i % w, i // w)
+                for i, v in enumerate(self._obs_grid.data) if v >= 50)
+
+        poly = remaining_polyline(
+            (cur.x, cur.y),
+            [(wp.x, wp.y) for wp in route.waypoints],
+            from_index)
+        return grid.route_passable(
+            (cur.x, cur.y), poly,
+            margin=self._pass_margin, band=self._pass_band)
 
     def map_pose(self) -> Optional[Pose2D]:
         """map -> base_link 를 TF에서 조회. AMCL 보정이 반영된 절대 위치."""

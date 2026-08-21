@@ -63,6 +63,7 @@ class ObstacleMonitor(Node):
         self.declare_parameter('scan_topic', '/scan')
         self.declare_parameter('map_topic', '/map')
         self.declare_parameter('marker_topic', '/obstacles/markers')
+        self.declare_parameter('grid_topic', '/obstacles/grid')
         self.declare_parameter('laser_frame', 'laser_frame')
 
         # 지도상 장애물이 이 반경 안에 있으면 '원래 있던 벽'으로 본다.
@@ -104,6 +105,10 @@ class ObstacleMonitor(Node):
             rclpy.qos.qos_profile_sensor_data)
         self._pub = self.create_publisher(
             MarkerArray, self.get_parameter('marker_topic').value, 1)
+        # 통행 판정용. 마커는 사람이 보는 것이고, 이 격자는 mission_manager가
+        # passability 판정에 쓴다. 확정된 장애물 셀만 100으로 찍는다.
+        self._grid_pub = self.create_publisher(
+            OccupancyGrid, self.get_parameter('grid_topic').value, map_qos())
 
         self.get_logger().info(
             '장애물 모니터 시작 (match_radius=%.2fm, cluster=%.2fm, min_points=%d)'
@@ -247,6 +252,38 @@ class ObstacleMonitor(Node):
                                    throttle_duration_sec=3.0)
 
         self._pub.publish(arr)
+        self._publish_grid(confirmed)
+
+    def _publish_grid(self, confirmed) -> None:
+        """확정 장애물을 정적 지도와 같은 좌표계/해상도의 격자로 발행.
+
+        mission_manager가 /map과 이 격자를 겹쳐서 '이 경로가 아직 뚫려 있는가'를
+        판정한다. 마커(MarkerArray)로는 그 계산을 할 수 없어서 따로 낸다.
+        """
+        base = self._map
+        if base is None:
+            return
+        info = base.info
+        g = OccupancyGrid()
+        g.header.frame_id = 'map'
+        g.header.stamp = self.get_clock().now().to_msg()
+        g.info = info
+        data = [0] * (info.width * info.height)
+
+        # 클러스터 격자(cluster_size)는 지도 해상도보다 크므로 셀 여러 개를 덮는다
+        span = max(1, int(round(self.cluster_size / info.resolution)))
+        for (gx, gy), _rec in confirmed:
+            wx = (gx + 0.5) * self.cluster_size
+            wy = (gy + 0.5) * self.cluster_size
+            cx = int((wx - info.origin.position.x) / info.resolution)
+            cy = int((wy - info.origin.position.y) / info.resolution)
+            for dy in range(-span // 2, span // 2 + 1):
+                for dx in range(-span // 2, span // 2 + 1):
+                    px, py = cx + dx, cy + dy
+                    if 0 <= px < info.width and 0 <= py < info.height:
+                        data[py * info.width + px] = 100
+        g.data = data
+        self._grid_pub.publish(g)
 
 
 def main(args=None):
