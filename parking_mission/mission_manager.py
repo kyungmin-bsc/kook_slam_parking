@@ -66,6 +66,7 @@ from .geometry import (
     solve_correction,
     to_slot_frame,
     total_length,
+    trail_to_prims,
     wrap_angle,
 )
 from .collision import FootprintChecker, plan_align, plan_parking
@@ -153,6 +154,9 @@ class LegStep(Step):
         self._cancelling = False
         self._retreating = False  # 다음 경로로 넘어가기 전 후진 중
         self._retreat_done = False
+        # 이 경로를 시작한 뒤 지나온 자취(map pose). 경로를 포기할 때
+        # 이 길을 그대로 되짚어 후진한다.
+        self._trail: List[Pose2D] = []
 
     # -- 진입 --------------------------------------------------------------
 
@@ -177,6 +181,7 @@ class LegStep(Step):
             self._cancelling = False
             self._retreating = False
             self._retreat_done = False
+            self._trail = []
             self._next_check = mgr.now() + mgr.check_period
 
             verdict = mgr.check_route(route, 0)
@@ -227,17 +232,22 @@ class LegStep(Step):
         if getattr(self, '_entered', RUNNING) == FAILED:
             return FAILED
 
+        # 후진 중이 아닐 때만 자취를 남긴다. 후진 자체를 기록하면
+        # 되짚기가 자기 자신을 되짚는 꼴이 된다.
+        if not self._retreating:
+            self._record_trail(mgr)
+
         # 후진해서 빠져나오는 중이면 끝날 때까지 기다린다
         if self._retreating:
             st = mgr.executor_.state
             if st in (EX_DONE, EX_FAILED):
                 if st == EX_FAILED:
-                    mgr.log('  후진 중단됨 (후방 장애물). 현 위치에서 경로 전환')
+                    mgr.log('  되짚기 중단됨 (후방 장애물). 현 위치에서 경로 전환')
                 else:
-                    mgr.log('  후진 완료. 다음 경로로 전환')
+                    mgr.log('  되짚기 완료. 다음 경로로 전환')
                 self._retreating = False
                 self._retreat_done = True
-                return self._switch_route(mgr, '후진 완료')
+                return self._switch_route(mgr, '되짚기 완료')
             return RUNNING
 
         # 목표 취소를 요청해둔 상태면 취소가 끝나기를 기다렸다가 경로를 바꾼다
@@ -371,28 +381,65 @@ class LegStep(Step):
         return self._switch_route(
             mgr, '경유점 %d에서 %d회 실패' % (self._wi + 1, self._tries))
 
+    def _record_trail(self, mgr: 'MissionManager') -> None:
+        """지나온 자취를 기록한다. 경로를 포기할 때 이 길을 그대로 되짚는다.
+
+        10cm마다 한 점이면 되짚기 끝점이 3mm 이내로 돌아온다
+        (geometry.trail_to_prims 주석의 검증 참고).
+        """
+        cur = mgr.map_pose()
+        if cur is None:
+            return
+        if not self._trail:
+            self._trail.append(cur)
+            return
+        last = self._trail[-1]
+        if (math.hypot(cur.x - last.x, cur.y - last.y) >= mgr.trail_step
+                or abs(wrap_angle(cur.yaw - last.yaw)) >= math.radians(10.0)):
+            self._trail.append(cur)
+
     def _switch_route(self, mgr: 'MissionManager', why: str) -> str:
         route = self.leg.routes[self._ri]
 
         # 좁은 통로 안에서 막혔다면, 그 자리에서 다음 경로 목표를 던져봐야
-        # Nav2가 경로를 못 만든다(차를 돌릴 공간이 없다). 왔던 길로 곧게
-        # 후진해 넓은 곳까지 빠져나온 뒤에 전환한다.
-        if route.retreat_distance > 0.0 and not self._retreat_done:
-            mgr.log('  "%s" 경로 포기 (%s) - 먼저 %.2fm 후진해서 빠져나온다'
-                    % (route.name, why, route.retreat_distance))
-            mgr.set_nav_enabled(False)
-            mgr.publish_motor(0.0, 0.0)
-            if self._goal_handle is not None:
-                self._goal_handle.cancel_goal_async()
-                self._goal_handle = None
-            self._result_future = None
-            self._goal_future = None
-            mgr.executor_.cfg.turn_radius = 0.5
-            mgr.executor_.start(
-                [Prim('S', route.retreat_distance, 0, -1, 0.0, 'retreat')],
-                tag='%s 후퇴' % route.name)
-            self._retreating = True
-            return RUNNING
+        # Nav2가 경로를 못 만든다(차를 돌릴 공간이 없다). 먼저 빠져나와야 한다.
+        #
+        # 예전에는 '곧게 N미터 후진'이었다. 통로가 곧을 때만 맞는 얘기다.
+        # A->B 구간처럼 굽은 길을 조금 가다가 막히면 그 직선 후진이 벽을 향한다.
+        # 그래서 이제는 **지나온 자취를 그대로 되짚어** 후진한다. 이미 그 길로
+        # 왔으니 그 길이 비어 있다는 것이 보장된다.
+        #
+        # retreat_distance는 이제 '되짚을 최대 거리'다. 0이면 이 구간을 시작한
+        # 지점까지 전부 되짚는다 (A->B에서 A로 완전히 돌아가는 동작).
+        if not self._retreat_done and len(self._trail) >= 2:
+            prims = trail_to_prims(self._trail, max_length=route.retreat_distance)
+            checker = mgr.footprint_checker()
+            cur = mgr.map_pose()
+            if prims and checker is not None and cur is not None:
+                worst, at = checker.sweep(cur, prims, 0.5)
+                if worst <= 0.0:
+                    where = ' @%.2f,%.2f' % at if at else ''
+                    mgr.log('  되짚기 경로가 벽에 닿음(%+.3fm%s) - 되짚기 생략'
+                            % (worst, where))
+                    prims = []
+            if prims:
+                back = total_length(prims)
+                mgr.log('  "%s" 경로 포기 (%s) - 지나온 %.2fm를 %d구간으로 '
+                        '되짚어 후진%s'
+                        % (route.name, why, back, len(prims),
+                           ' (상한 %.2fm)' % route.retreat_distance
+                           if route.retreat_distance > 0 else ' (구간 시작점까지)'))
+                mgr.set_nav_enabled(False)
+                mgr.publish_motor(0.0, 0.0)
+                if self._goal_handle is not None:
+                    self._goal_handle.cancel_goal_async()
+                    self._goal_handle = None
+                self._result_future = None
+                self._goal_future = None
+                mgr.executor_.cfg.turn_radius = 0.5   # radius를 든 구간은 각자 사용
+                mgr.executor_.start(prims, tag='%s 되짚기' % route.name)
+                self._retreating = True
+                return RUNNING
 
         mgr.log('  "%s" 경로 포기 (%s)' % (route.name, why))
         self._ri += 1
@@ -561,7 +608,7 @@ class ParkStep(Step):
         checker = mgr.footprint_checker()
         if checker is not None:
             worst, at = checker.sweep(cur, prims, radius)
-            if worst < 0.0:
+            if worst <= 0.0:      # 0 = 차체가 장애물 셀 안
                 where = ' @%.2f,%.2f' % at if at else ''
                 mgr.log('  보정 기동이 벽에 닿음 (여유 %+.3fm%s). 현 상태로 종료'
                         % (worst, where))
@@ -770,6 +817,10 @@ class MissionManager(Node):
         # 경유점은 통과점일 뿐이라 그럴 이유가 없다. 멈췄다 다시 서는 동작이
         # 사라져 훨씬 매끄럽고 빨라진다.
         self.declare_parameter('waypoint_pass_radius', 0.35)
+        # 지나온 자취를 몇 미터마다 한 점씩 기록할지.
+        # 경로를 포기할 때 이 자취를 그대로 되짚어 후진한다. 10cm면 되짚기
+        # 끝점이 3mm 이내로 돌아온다 (geometry.trail_to_prims 검증 참고).
+        self.declare_parameter('trail_step', 0.10)
         self.declare_parameter('map_topic', '/map')
         self.declare_parameter('obstacle_grid_topic', '/obstacles/grid')
 
@@ -812,6 +863,7 @@ class MissionManager(Node):
         self._pass_band = float(self.get_parameter('pass_band').value)
         self.wp_pass_radius = float(
             self.get_parameter('waypoint_pass_radius').value)
+        self.trail_step = float(self.get_parameter('trail_step').value)
         self.park_min_progress = float(
             self.get_parameter('park_min_progress').value)
 

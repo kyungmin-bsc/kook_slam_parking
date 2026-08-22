@@ -17,9 +17,9 @@ geometry.py의 해석해(solve_parallel / solve_parallel_straight_first)는
 
                     현실적 오차          큰 오차
                     ±0.2m/±0.15m/±15도   ±0.4m/±0.3m/±25도
-      A 동측 진입    42/125  (34%)       80/125  (64%)
-      A 북측 진입     2/125               33/125
-      B              9/125               54/125
+      A 동측 진입    50/125  (40%)       81/125  (65%)
+      A 북측 진입     5/125               39/125
+      B             11/125               51/125
 
 동측 진입이 특히 나쁘다. 사용자가 실제로 본 것이 이 경우다.
 이상적인 진입점에 정확히 섰을 때만 안전했는데, 진입점에 정확히 서는 건
@@ -27,8 +27,8 @@ Nav2 허용오차(xy 0.20m)상 애초에 보장되지 않는다.
 
 무엇을 하는가
 -------------
-1) 기동 경로를 4cm 간격으로 샘플링하고, 각 자세마다 차체를 원판 사슬로
-   근사해서 지도 여유(clearance)를 잰다.
+1) 기동 경로를 4cm 간격으로 샘플링하고, 각 자세마다 차체 사각형 외곽선을
+   3cm 간격으로 찍어 지도 여유(clearance)를 잰다.
 2) 해석해를 하나만 쓰지 않고 **후보를 여럿 만든다** - 두 가지 해법
    (직선우선 / 기본순서) x 회전반경 7종.
 3) 그중 충돌 검사를 통과한 것만 남기고, 선호 해법 -> 짧은 순 -> 여유 큰 순으로
@@ -38,7 +38,7 @@ Nav2 허용오차(xy 0.20m)상 애초에 보장되지 않는다.
 같은 격자에서 이 방식의 결과:
 
     벽을 지나는 해를 고르는 경우 = 0 (설계상 불가능하다)
-    현실적 오차에서 해를 못 찾는 경우 = 125개 중 1(A동측) / 5(A북측) / 11(B)
+    현실적 오차에서 해를 못 찾는 경우 = 125개 중 0(A동측) / 5(A북측) / 8(B)
         그 경우는 주차를 시도조차 하지 않고 실패로 보고한다. 벽을 뚫는 것보다
         낫고, 애초에 그 자리에 서면 안 됐다는 뜻이다.
 
@@ -71,9 +71,17 @@ FOOTPRINT_FRONT = 0.46
 FOOTPRINT_REAR = -0.15
 FOOTPRINT_HALF_WIDTH = 0.15
 
-# 차체를 원판 사슬로 근사할 때 원판 개수. 전장 0.61m를 8등분하면 7.6cm 간격이라
-# 반폭 0.15m 원판끼리 넉넉히 겹친다 (사각형 모서리를 조금 크게 보는 쪽이다).
-BODY_DISKS = 8
+# 차체 외곽선 샘플 간격(m).
+#
+# 처음에는 차체를 '중심선 위 원판 사슬'로 근사했다. 간단하지만 앞뒤로 반폭
+# 0.15m씩 부풀어난다 - 중심선 맨 앞(x=0.46)에 반경 0.15 원판을 놓으면 그 원판이
+# x=0.61까지 뻗기 때문이다. 전장 0.61m 차를 0.91m로 보는 셈이라, 차 앞코에
+# 6cm 여유가 있는 상황을 '4cm 겹침'으로 오판했다.
+#
+# 그래서 실제 사각형 외곽선을 따라 점을 찍는다. 그러면 여유값이 곧 '차체
+# 표면에서 장애물까지의 실제 거리'가 되어 로그를 그대로 믿을 수 있다.
+# 3cm 간격이면 격자 해상도 5cm보다 촘촘해서 셀 사이로 새지 않는다.
+OUTLINE_STEP = 0.03
 
 # 경로 샘플 간격. 4cm는 격자 해상도(5cm)보다 촘촘해서 셀을 건너뛰지 않는다.
 SWEEP_STEP = 0.04
@@ -82,8 +90,12 @@ SWEEP_STEP = 0.04
 # 최소반경 0.33/tan(35deg) = 0.47m. 여유를 두고 0.50부터 쓴다.
 CANDIDATE_RADII: Tuple[float, ...] = (0.50, 0.55, 0.62, 0.70, 0.80, 0.92, 1.05)
 
-WANT_CLEARANCE = 0.06     # 확보하고 싶은 여유(m)
-HARD_CLEARANCE = 0.02     # 절대 하한(m). 이보다 좁으면 어떤 경우에도 안 쓴다
+# 여유 기준(m). 외곽선 모델이라 이 값은 '차체 표면에서 장애물까지의 실제 거리'다.
+# 원판 사슬을 쓰던 때보다 앞뒤로 15cm씩 덜 보수적이므로, 그만큼 기준을 올렸다.
+WANT_CLEARANCE = 0.10     # 확보하고 싶은 여유
+HARD_CLEARANCE = 0.03     # 절대 하한. 이보다 좁으면 어떤 경우에도 안 쓴다.
+                          # clearance는 0 이상만 나오고 0 = '장애물 셀 안'이므로,
+                          # 한 셀(5cm)의 절반 이상은 떨어져 있어야 한다는 뜻이다.
 
 
 class FootprintChecker:
@@ -95,28 +107,49 @@ class FootprintChecker:
         self.half_width = half_width
         self.front = front
         self.rear = rear
+        self._outline_cache: Optional[List[Tuple[float, float]]] = None
 
-    def _disks(self, p: Pose2D) -> Iterable[Tuple[float, float]]:
+    def _local_outline(self) -> List[Tuple[float, float]]:
+        """차체 좌표계에서의 외곽선 점들. 자세마다 다시 만들 필요가 없다."""
+        if self._outline_cache is None:
+            hw, f, r = self.half_width, self.front, self.rear
+            pts: List[Tuple[float, float]] = []
+            corners = [(f, hw), (f, -hw), (r, -hw), (r, hw)]
+            for i in range(4):
+                ax, ay = corners[i]
+                bx, by = corners[(i + 1) % 4]
+                n = max(1, int(math.ceil(math.hypot(bx - ax, by - ay)
+                                         / OUTLINE_STEP)))
+                for k in range(n):          # 끝점은 다음 변의 시작점이라 뺀다
+                    t = k / n
+                    pts.append((ax + (bx - ax) * t, ay + (by - ay) * t))
+            self._outline_cache = pts
+        return self._outline_cache
+
+    def outline(self, p: Pose2D) -> Iterable[Tuple[float, float]]:
+        """map 좌표계에서 이 자세의 차체 외곽선 점들."""
         c, s = math.cos(p.yaw), math.sin(p.yaw)
-        span = self.front - self.rear
-        for k in range(BODY_DISKS + 1):
-            d = self.rear + span * k / BODY_DISKS
-            yield (p.x + d * c, p.y + d * s)
+        for a, b in self._local_outline():
+            yield (p.x + a * c - b * s, p.y + a * s + b * c)
 
     def clearance_pose(self, p: Pose2D) -> float:
-        """이 자세에서 차체와 장애물 사이 최소 여유(m). 음수면 겹친다."""
-        return min(self.grid.clearance_at(x, y)
-                   for x, y in self._disks(p)) - self.half_width
+        """이 자세에서 차체 표면과 장애물 사이 최소 거리(m). 0이면 닿는다."""
+        return min(self.grid.clearance_at(x, y) for x, y in self.outline(p))
 
     def sweep(self, start: Pose2D, prims: List[Prim], radius: float,
               step: float = SWEEP_STEP
               ) -> Tuple[float, Optional[Tuple[float, float]]]:
-        """기동 전체의 최소 여유와 그 지점."""
+        """기동 전체의 최소 여유와 그 지점.
+
+        경로를 4cm 간격으로 훑으면서 매 자세의 외곽선을 검사한다. 장애물이
+        차체 '안쪽'에 통째로 들어가 있으면 외곽선만으로는 못 잡지만, 연속된
+        스윕이라 그 전에 반드시 외곽선을 지나가므로 실질적으로 문제없다.
+        """
         worst = float('inf')
         at: Optional[Tuple[float, float]] = None
         for p in sample_path(start, prims, radius, step):
-            for (x, y) in self._disks(p):
-                c = self.grid.clearance_at(x, y) - self.half_width
+            for (x, y) in self.outline(p):
+                c = self.grid.clearance_at(x, y)
                 if c < worst:
                     worst, at = c, (x, y)
         if worst == float('inf'):
@@ -352,7 +385,7 @@ if __name__ == '__main__':
                         st = Pose2D(base.x + dx, base.y + dy,
                                     base.yaw + math.radians(dth))
                         old, R = legacy(st, slot)
-                        if old and ck.sweep(st, old, R)[0] < 0.0:
+                        if old and ck.sweep(st, old, R)[0] <= 0.0:
                             hit += 1
                         plan = plan_parking(ck, st, slot)
                         if plan is not None:

@@ -109,6 +109,14 @@ class Prim:
     angle: float = 0.0
     label: str = ''
 
+    # 이 구간만 다른 회전반경을 쓸 때. None이면 기동 전체의 기본 반경을 쓴다.
+    #
+    # 해석해(solve_*)는 전부 단일 반경이라 여기를 안 쓴다. 필요한 곳은 딱
+    # 하나 - 주행 궤적을 되짚는 후진(mission_manager의 되짚기)이다. 실제로
+    # 지나온 길은 구간마다 곡률이 다르므로 구간별 반경이 있어야 한다.
+    # label 뒤에 둔 이유: 앞에 끼우면 기존 위치인자 호출이 전부 깨진다.
+    radius: Optional[float] = None
+
     @property
     def d_yaw(self) -> float:
         """이 구간에서 발생하는 yaw 변화량(부호 포함)."""
@@ -140,11 +148,17 @@ def _straight_end(pose: Pose2D, prim: Prim) -> Pose2D:
     )
 
 
+def prim_radius(prim: Prim, default: float) -> float:
+    """이 구간에 적용할 회전반경. 구간이 자기 반경을 들고 있으면 그것을 쓴다."""
+    return default if prim.radius is None else prim.radius
+
+
 def integrate(start: Pose2D, prims: List[Prim], radius: float) -> Pose2D:
     """프리미티브 나열을 적분해서 최종 pose를 얻는다. 해(解) 검증용."""
     pose = Pose2D(start.x, start.y, start.yaw)
     for p in prims:
-        pose = _straight_end(pose, p) if p.kind == 'S' else _arc_end(pose, radius, p)
+        pose = (_straight_end(pose, p) if p.kind == 'S'
+                else _arc_end(pose, prim_radius(p, radius), p))
     return pose
 
 
@@ -166,8 +180,8 @@ def sample_prim(start: Pose2D, prim: Prim, radius: float,
             direction=prim.direction,
             angle=prim.angle * frac,
         )
-        poses.append(_arc_end(start, radius, sub) if prim.kind == 'C'
-                     else _straight_end(start, sub))
+        poses.append(_arc_end(start, prim_radius(prim, radius), sub)
+                     if prim.kind == 'C' else _straight_end(start, sub))
     return poses
 
 
@@ -199,8 +213,8 @@ def sample_path(start: Pose2D, prims: List[Prim], radius: float,
                 direction=p.direction,
                 angle=p.angle * frac,
             )
-            poses.append(_arc_end(pose, radius, sub) if p.kind == 'C'
-                         else _straight_end(pose, sub))
+            poses.append(_arc_end(pose, prim_radius(p, radius), sub)
+                         if p.kind == 'C' else _straight_end(pose, sub))
         pose = poses[-1]
     return poses
 
@@ -224,6 +238,7 @@ def reverse_prims(prims: List[Prim]) -> List[Prim]:
             direction=-p.direction,
             angle=p.angle,
             label=(p.label + '-exit') if p.label else 'exit',
+            radius=p.radius,
         ))
     return out
 
@@ -242,8 +257,93 @@ def partial_exit(prims: List[Prim], fraction: float) -> List[Prim]:
     f = max(0.05, fraction)
     last = out[-1]
     out[-1] = Prim(last.kind, last.length * f, last.turn, last.direction,
-                   last.angle * f, last.label)
+                   last.angle * f, last.label, last.radius)
     return out
+
+
+def trail_to_prims(trail: List[Pose2D], max_length: float = 0.0,
+                   curvature_tol: float = 0.25,
+                   straight_kappa: float = 0.25) -> List[Prim]:
+    """지나온 자취(map pose 나열)를 **되짚어 후진**하는 구간들로 바꾼다.
+
+    왜 필요한가
+    -----------
+    좁은 통로 안에서 장애물을 만나 경로를 포기할 때, 그 자리에서 다른 통로
+    입구로 가는 길을 Nav2가 못 만든다. 차를 돌릴 공간이 없기 때문이다.
+    예전에는 '곧게 N미터 후진'으로 때웠는데, 통로가 굽어 있으면 그 직선 후진이
+    벽을 향한다. 실제로 지나온 길을 그대로 되짚는 것이 유일하게 항상 안전하다.
+    이미 그 길로 왔으니 그 길은 비어 있다.
+
+    어떻게
+    ------
+    자취의 이웃한 두 pose에서 자전거 모델 원호를 하나씩 역산한다
+    (현 d = 두 점 거리, dyaw = 방위 변화 -> R = d/2 / sin(dyaw/2)).
+    그런 다음 곡률이 비슷한 것끼리 묶는다. 묶지 않으면 10cm마다 구간이 생기고,
+    구간마다 조향 정렬(pre_steer 0.35s)이 들어가서 후진 3m에 10초를 버린다.
+
+    되짚기이므로 순서를 뒤집고 direction=-1로 만든다. turn 부호는 그대로 둔다 -
+    자전거 모델은 시간 대칭이라 '핸들을 그대로 두고 후진'하면 왔던 길로 돌아간다.
+
+    max_length > 0 이면 그만큼만 되짚는다(최근 구간부터). 0이면 전부.
+
+    정확도: 자취를 10cm 간격으로 기록하면 되짚기 끝점이 출발점에서 3mm 이내로
+    돌아온다(직선+원호+직선 / S자 / 완만한 긴 통로 3종 검증). curvature_tol을
+    0.6으로 키우면 구간 수는 3->2로 줄지만 오차가 8cm까지 벌어져서 폭 0.70m
+    통로에서는 위험하다. 그래서 기본값을 0.25로 둔다.
+    """
+    if len(trail) < 2:
+        return []
+
+    # 1) 이웃 pose쌍 -> 원호/직선 조각
+    segs = []          # (length, kappa(부호), turn)
+    for a, b in zip(trail, trail[1:]):
+        d = math.hypot(b.x - a.x, b.y - a.y)
+        if d < 1e-4:
+            continue
+        dyaw = wrap_angle(b.yaw - a.yaw)
+        if abs(dyaw) < 1e-6:
+            segs.append((d, 0.0))
+            continue
+        r = (d / 2.0) / max(abs(math.sin(dyaw / 2.0)), 1e-9)
+        arc_len = r * abs(dyaw)
+        segs.append((arc_len, math.copysign(1.0 / r, dyaw)))
+
+    if not segs:
+        return []
+
+    # 2) 곡률이 비슷한 조각끼리 묶기
+    groups = []        # [길이합, 곡률*길이 합]
+    for length, kappa in segs:
+        if groups:
+            cur_len, cur_kl = groups[-1]
+            cur_k = cur_kl / cur_len
+            near_straight = abs(cur_k) < straight_kappa and abs(kappa) < straight_kappa
+            same_sign = cur_k * kappa > 0 or abs(kappa) < 1e-9 or abs(cur_k) < 1e-9
+            close = abs(kappa - cur_k) <= curvature_tol * max(abs(cur_k), 0.5)
+            if near_straight or (same_sign and close):
+                groups[-1] = [cur_len + length, cur_kl + kappa * length]
+                continue
+        groups.append([length, kappa * length])
+
+    # 3) 뒤에서부터 꺼내 후진 구간으로. max_length에서 잘린다.
+    out: List[Prim] = []
+    used = 0.0
+    for length, kl in reversed(groups):
+        if max_length > 0.0 and used >= max_length - 1e-6:
+            break
+        # 곡률은 반드시 '자르기 전' 길이로 구한다. 자른 길이로 나누면
+        # 남은 조각의 곡률이 부풀어 엉뚱한 조향이 나온다.
+        kappa = kl / max(length, 1e-9)
+        if max_length > 0.0:
+            length = min(length, max_length - used)
+        used += length
+        if abs(kappa) < 1e-3 or 1.0 / abs(kappa) > 20.0:
+            out.append(Prim('S', length, 0, -1, 0.0, 'retrace'))
+        else:
+            r = 1.0 / abs(kappa)
+            out.append(Prim('C', length, 1 if kappa > 0 else -1, -1,
+                            length / r, 'retrace', r))
+    return [p for p in out if p.length > 0.02]
 
 
 def prims_to_steer(prims: List[Prim], wheelbase: float, radius: float,

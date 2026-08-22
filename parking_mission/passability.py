@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import math
 import heapq
-from collections import deque
 from dataclasses import dataclass, field
 from typing import Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -216,38 +215,111 @@ class PassabilityGrid:
         need = CAR_HALF_WIDTH + margin
         clear = self.clearance_grid()
 
-        band_cells = self._band_cells(polyline, band)
-        if not band_cells:
-            return PassResult(False, '경로가 격자 범위를 벗어남')
+        if len(polyline) < 2:
+            return PassResult(False, '경로에 구간이 없음')
 
-        def ok(cell):
-            cx, cy = cell
-            if not info.inside(cx, cy) or cell not in band_cells:
-                return False
-            return clear[cy * info.width + cx] >= need
+        def make_ok(cells):
+            def ok(cell):
+                cx, cy = cell
+                if not info.inside(cx, cy) or cell not in cells:
+                    return False
+                return clear[cy * info.width + cx] >= need
+            return ok
 
-        start_cell = self._nearest_ok(info.to_cell(*start), ok, radius=6)
+        first_ok = make_ok(self._band_cells(polyline[:2], band))
+        start_cell = self._nearest_ok(info.to_cell(*start), first_ok, radius=6)
         if start_cell is None:
             return PassResult(
                 False, '현재 위치 주변에 통과 가능한 셀이 없음 (차가 이미 갇힘)',
                 blocked_at=start)
 
-        goal_xy = polyline[-1]
-        goal_cell = self._nearest_ok(info.to_cell(*goal_xy), ok,
-                                     radius=max(2, int(goal_tol / info.resolution)))
-        if goal_cell is None:
-            return PassResult(False, '구간 목표 지점이 막힘', blocked_at=goal_xy)
-
-        # 병목 최대화(widest path) 탐색.
+        # 경유점 사이 구간을 **하나씩 따로** 판정하고, 각 구간은 **그 구간의
+        # band 안에서만** 탐색한다.
         #
-        # 단순 BFS를 쓰면 "최소 조건만 겨우 만족하는 아무 경로"를 찾아서, 보고되는
-        # 통과폭이 항상 임계값과 같아진다. 실제로 얼마나 여유 있게 지날 수 있는지
-        # 알 수 없다. 여기서는 경로 위 최소 여유가 '최대'가 되는 길을 찾는다.
-        # Prim/Dijkstra 변형으로, 우선순위 큐에서 병목이 가장 큰 셀을 먼저 편다.
+        # 예전에는 시작->최종목표를 한 번에, 경로 전체 band의 합집합 위에서
+        # 탐색했다. 두 가지가 동시에 깨졌다.
+        #
+        #  (1) 순서를 건너뛴다. 경로가 출발점 근처로 되돌아오는 모양이면
+        #      중간을 통째로 생략하고 지름길로 빠진다. 'B->출발 북측우회'가
+        #      그랬다 - 북측 가장자리가 완전히 막혔는데도 반환된 통과 경로가
+        #      y=0.97 아래에서만 움직이고 '통과 가능'이 나왔다.
+        #  (2) 옆 통로로 샌다. 합집합 band는 경로가 지나는 모든 통로를 포함하므로,
+        #      한 구간이 막히면 다른 구간의 통로로 크게 우회하는 길을 찾아낸다.
+        #      실제로 동측 y=4.70이 막혔는데 남쪽->서쪽->북측통로로 한 바퀴 도는
+        #      경로를 찾아 '통과 가능'이라고 했다.
+        #
+        # 구간별 band로 좁히면 둘 다 사라진다. '이 경로는 이 통로로만 간다'는
+        # 원래 의도와도 맞는다. 구간별 band는 경유점 근처에서 서로 겹치므로
+        # 이어지는 데 문제가 없고, 통로 안에서 장애물을 비켜가는 여유는 그대로다.
+        legs = list(zip(polyline[:-1], polyline[1:]))
+        goal_span = max(2, int(goal_tol / info.resolution))
+
+        cur_cell = start_cell
+        tightest = float('inf')
+        tight_at = None
+        detour = 0.0
+        full_path: List[Tuple[float, float]] = []
+        reached_all: Set[Tuple[int, int]] = set()
+
+        for li, leg in enumerate(legs):
+            last_leg = li == len(legs) - 1
+            ok = first_ok if li == 0 else make_ok(self._band_cells(leg, band))
+            goal_cell = self._nearest_ok(info.to_cell(*leg[1]), ok,
+                                         radius=goal_span)
+            if goal_cell is None:
+                return PassResult(False,
+                                  '구간 목표 지점이 막힘' if last_leg
+                                  else '경유점 %d이 막힘' % (li + 1),
+                                  blocked_at=leg[1])
+
+            # 이전 구간의 끝이 이번 구간의 band 밖일 수 있다(경유점에서 꺾일 때).
+            # 가장 가까운 통행 가능 셀로 옮겨 붙인다.
+            leg_start = cur_cell if ok(cur_cell) else self._nearest_ok(
+                cur_cell, ok, radius=goal_span)
+            if leg_start is None:
+                return PassResult(False, '경유점 %d 부근이 막힘' % (li + 1),
+                                  blocked_at=leg[0])
+
+            res = self._widest(leg_start, goal_cell, ok, clear, polyline,
+                               want_reached=True)
+            if res is None or res[0] is None:
+                # 막힌 지점은 **이 구간 위에서** 찾아야 한다. 경로 전체에서
+                # 찾으면 이미 통과한 앞 구간의 엉뚱한 점이 나온다.
+                settled = res[1] if res is not None else reached_all
+                blocked = self._first_blocked(list(leg), clear, need, settled)
+                return PassResult(False, '경로가 장애물로 끊김',
+                                  blocked_at=blocked or leg[1])
+            part, settled = res
+            reached_all |= settled
+            if part.tightest < tightest:
+                tightest, tight_at = part.tightest, part.tightest_at
+            detour = max(detour, part.detour)
+            full_path.extend(part.path if not full_path else part.path[1:])
+            cur_cell = goal_cell
+
+        if tightest == float('inf'):
+            tightest = clear[start_cell[1] * info.width + start_cell[0]]
+        return PassResult(True, '통과 가능', tightest, tight_at,
+                          detour=detour, path=full_path)
+
+    def _widest(self, start_cell, goal_cell, ok, clear, polyline,
+                want_reached: bool = False):
+        """병목 최대화(widest path) 탐색.
+
+        찾으면 (PassResult, 도달셀집합). 못 찾으면 None - 다만 want_reached면
+        (None, 도달셀집합)을 돌려줘서 호출한 쪽이 '어디서 막혔는지'를 그 구간
+        안에서 찾을 수 있게 한다.
+
+        단순 BFS를 쓰면 "최소 조건만 겨우 만족하는 아무 경로"를 찾아서, 보고되는
+        통과폭이 항상 임계값과 같아진다. 실제로 얼마나 여유 있게 지날 수 있는지
+        알 수 없다. 여기서는 경로 위 최소 여유가 '최대'가 되는 길을 찾는다.
+        Prim/Dijkstra 변형으로, 우선순위 큐에서 병목이 가장 큰 셀을 먼저 편다.
+        """
+        info = self.info
         best = {start_cell: clear[start_cell[1] * info.width + start_cell[0]]}
         parent = {start_cell: None}
         heap = [(-best[start_cell], start_cell)]
-        settled = set()
+        settled: Set[Tuple[int, int]] = set()
 
         while heap:
             neg_b, cur = heapq.heappop(heap)
@@ -256,7 +328,7 @@ class PassabilityGrid:
             settled.add(cur)
             b = -neg_b
             if cur == goal_cell:
-                return self._summarize(cur, parent, clear, polyline, b)
+                return self._summarize(cur, parent, clear, polyline, b), settled
             cx, cy = cur
             for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1),
                            (1, 1), (1, -1), (-1, 1), (-1, -1)):
@@ -268,11 +340,7 @@ class PassabilityGrid:
                     best[nxt] = nb
                     parent[nxt] = cur
                     heapq.heappush(heap, (-nb, nxt))
-
-        # 못 갔다. 경로 위에서 처음 막힌 지점을 찾아 알려준다.
-        blocked = self._first_blocked(polyline, clear, need, settled)
-        return PassResult(False, '경로가 장애물로 끊김',
-                          blocked_at=blocked)
+        return (None, settled) if want_reached else None
 
     # -- 내부 --------------------------------------------------------------
 
@@ -428,7 +496,11 @@ if __name__ == '__main__':
         if obstacles:
             g.add_obstacle_points(obstacles, radius)
         start = (cfg.START_POSE.x, cfg.START_POSE.y)
-        r = g.route_passable(start, poly(route))
+        # 실제 노드와 똑같이 현재 위치를 경로 앞에 붙인다. 구간별 band로
+        # 판정하므로, 이걸 빼면 첫 구간 band 밖에 서 있는 셈이 되어
+        # '차가 이미 갇힘'이 나온다.
+        r = g.route_passable(start, remaining_polyline(start, poly(route), 0),
+                             band=0.40)
         mark = 'ok  ' if r.passable else 'BLOCK'
         print('  [%s] %-28s %s' % (mark, label, r.describe()))
         return r.passable

@@ -120,7 +120,10 @@ class ManeuverExecutor:
     def steer_for(self, prim: Prim) -> float:
         if prim.kind == 'S':
             return 0.0
-        radius = self.cfg.turn_radius / max(self.cfg.radius_scale, 1e-3)
+        # 구간이 자기 반경을 들고 있으면 그것을 쓴다. 주행 궤적 되짚기처럼
+        # 구간마다 곡률이 다른 기동에 필요하다.
+        base = self.cfg.turn_radius if prim.radius is None else prim.radius
+        radius = base / max(self.cfg.radius_scale, 1e-3)
         deg = math.degrees(math.atan2(self.cfg.wheelbase, radius))
         deg = min(deg, self.cfg.steer_limit_deg)
         return prim.turn * deg
