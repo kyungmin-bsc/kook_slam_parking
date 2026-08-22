@@ -147,6 +147,23 @@ class ManeuverExecutor:
         for i, (p, s) in enumerate(zip(self._prims, self._steer)):
             self._log('  [%d] %s' % (i, describe(p, s)))
 
+    def progress(self) -> float:
+        """계획된 전체 이동거리 대비 실제로 굴러간 비율 (0.0~1.0).
+
+        기동이 중단됐을 때 "거의 다 왔는데 멈춘 것"과 "시작하자마자 막힌 것"을
+        가르기 위해 필요하다. 둘은 대응이 완전히 다르다.
+
+        - 초반 중단: 진입 자세나 장애물이 문제다. 주차가 안 된 것이다.
+        - 막바지 중단: 이미 슬롯 안이다. 그 자리를 주차로 인정하고 남은 오차는
+          보정 기동으로 다듬는 편이 낫다. 실제로 후방 정지는 늘 기동의 74~83%
+          지점에서 걸린다(ultrasonic.py 표 참고).
+        """
+        total = sum(p.length for p in self._prims)
+        if total <= 1e-6:
+            return 1.0
+        done = sum(p.length for p in self._prims[:self._idx]) + self._dist
+        return max(0.0, min(1.0, done / total))
+
     def abort(self, reason: str) -> None:
         self.stop_motor()
         self.state = FAILED
@@ -280,3 +297,4 @@ def describe(prim: Prim, steer_deg: float) -> str:
     side = '좌' if prim.turn > 0 else '우'
     return '원호 %s %s%.1fdeg %.3fm (조향 %+.1fdeg)' % (
         way, side, math.degrees(prim.angle), prim.length, steer_deg)
+

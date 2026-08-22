@@ -57,20 +57,18 @@ from tf2_ros import Buffer, TransformListener
 from . import mission_config as cfg
 from .geometry import (
     Pose2D,
+    Prim,
     from_slot_frame,
     integrate,
     partial_exit,
     reverse_prims,
     sample_path,
-    solve_parallel,
-    solve_parallel_straight_first,
     solve_correction,
-    solve_perpendicular,
-    solve_straight_only,
     to_slot_frame,
     total_length,
     wrap_angle,
 )
+from .collision import FootprintChecker, plan_align, plan_parking
 from .motion import DONE as EX_DONE
 from .motion import FAILED as EX_FAILED
 from .motion import ManeuverExecutor, MotionConfig
@@ -153,6 +151,8 @@ class LegStep(Step):
         self._next_check = 0.0    # 다음 통행 판정 시각
         self._blocked_hits = 0    # 연속 '막힘' 판정 횟수 (스파이크 방지)
         self._cancelling = False
+        self._retreating = False  # 다음 경로로 넘어가기 전 후진 중
+        self._retreat_done = False
 
     # -- 진입 --------------------------------------------------------------
 
@@ -163,12 +163,20 @@ class LegStep(Step):
 
     def _start_route(self, mgr: 'MissionManager') -> str:
         """이 경로를 시작한다. 선제 판정에서 막혀 있으면 다음 순위로 넘긴다."""
+        # 반드시 여기서 다시 켠다.
+        # 후진(retreat)이나 주차 기동 때 set_nav_enabled(False)로 꺼두는데,
+        # 예전에는 enter()에서 한 번만 켜서 후진 뒤에 그대로 꺼진 채 남았다.
+        # 그러면 경로를 바꿔 목표를 보내도 cmd_vel_bridge가 모터 명령을 막아
+        # 차가 후진만 하고 앞으로 가지 않았다.
+        mgr.set_nav_enabled(True)
         while self._ri < len(self.leg.routes):
             route = self.leg.routes[self._ri]
             self._wi = 0
             self._tries = 0
             self._blocked_hits = 0
             self._cancelling = False
+            self._retreating = False
+            self._retreat_done = False
             self._next_check = mgr.now() + mgr.check_period
 
             verdict = mgr.check_route(route, 0)
@@ -219,6 +227,19 @@ class LegStep(Step):
         if getattr(self, '_entered', RUNNING) == FAILED:
             return FAILED
 
+        # 후진해서 빠져나오는 중이면 끝날 때까지 기다린다
+        if self._retreating:
+            st = mgr.executor_.state
+            if st in (EX_DONE, EX_FAILED):
+                if st == EX_FAILED:
+                    mgr.log('  후진 중단됨 (후방 장애물). 현 위치에서 경로 전환')
+                else:
+                    mgr.log('  후진 완료. 다음 경로로 전환')
+                self._retreating = False
+                self._retreat_done = True
+                return self._switch_route(mgr, '후진 완료')
+            return RUNNING
+
         # 목표 취소를 요청해둔 상태면 취소가 끝나기를 기다렸다가 경로를 바꾼다
         if self._cancelling:
             if self._result_future is not None and not self._result_future.done():
@@ -248,7 +269,28 @@ class LegStep(Step):
         if self._goal_handle is not None and mgr.now() >= self._next_check:
             self._next_check = mgr.now() + mgr.check_period
             verdict = mgr.check_route(route, self._wi)
-            if verdict is not None and not verdict.passable:
+
+            # 막힌 지점이 아직 멀면 판단을 미룬다.
+            #
+            # 라이다가 6m까지 보므로, 저 앞의 장애물 하나로 통행 판정이 바로
+            # '불가'가 되어 한참 전에 경로를 포기하는 일이 있었다. 그런데
+            # 멀리서 본 것은 위치도 부정확하고, 가까이 가보면 Nav2가 지역적으로
+            # 비켜갈 수 있는 경우도 많다.
+            # 그래서 막힌 지점이 block_min_distance 안으로 들어왔을 때만
+            # 전환을 검토한다. 그 전까지는 계속 전진하며 다시 본다.
+            far = False
+            if verdict is not None and not verdict.passable and verdict.blocked_at:
+                cur = mgr.map_pose()
+                if cur is not None:
+                    d = math.hypot(cur.x - verdict.blocked_at[0],
+                                   cur.y - verdict.blocked_at[1])
+                    if d > mgr.block_min_distance:
+                        far = True
+                        mgr.log('    통행 감시: %.2fm 앞이 막힘 - 아직 머니 '
+                                '접근하며 재확인 (기준 %.2fm)'
+                                % (d, mgr.block_min_distance),)
+
+            if verdict is not None and not verdict.passable and not far:
                 self._blocked_hits += 1
                 mgr.log('    통행 감시: %s (%d/%d)'
                         % (verdict.describe(), self._blocked_hits,
@@ -260,7 +302,7 @@ class LegStep(Step):
                     if self._goal_handle is not None:
                         self._goal_handle.cancel_goal_async()
                     return RUNNING
-            else:
+            elif not far:
                 if self._blocked_hits and verdict is not None:
                     mgr.log('    통행 감시: 회복 - %s' % verdict.describe())
                 self._blocked_hits = 0
@@ -331,6 +373,27 @@ class LegStep(Step):
 
     def _switch_route(self, mgr: 'MissionManager', why: str) -> str:
         route = self.leg.routes[self._ri]
+
+        # 좁은 통로 안에서 막혔다면, 그 자리에서 다음 경로 목표를 던져봐야
+        # Nav2가 경로를 못 만든다(차를 돌릴 공간이 없다). 왔던 길로 곧게
+        # 후진해 넓은 곳까지 빠져나온 뒤에 전환한다.
+        if route.retreat_distance > 0.0 and not self._retreat_done:
+            mgr.log('  "%s" 경로 포기 (%s) - 먼저 %.2fm 후진해서 빠져나온다'
+                    % (route.name, why, route.retreat_distance))
+            mgr.set_nav_enabled(False)
+            mgr.publish_motor(0.0, 0.0)
+            if self._goal_handle is not None:
+                self._goal_handle.cancel_goal_async()
+                self._goal_handle = None
+            self._result_future = None
+            self._goal_future = None
+            mgr.executor_.cfg.turn_radius = 0.5
+            mgr.executor_.start(
+                [Prim('S', route.retreat_distance, 0, -1, 0.0, 'retreat')],
+                tag='%s 후퇴' % route.name)
+            self._retreating = True
+            return RUNNING
+
         mgr.log('  "%s" 경로 포기 (%s)' % (route.name, why))
         self._ri += 1
         if self._ri >= len(self.leg.routes):
@@ -348,81 +411,121 @@ class ParkStep(Step):
 
     def enter(self, mgr: 'MissionManager') -> None:
         self._corrections = 0
+        self._aligned = False        # 정렬 기동을 이미 한 번 썼는가
+        self._phase = 'park'
         # 1) Nav2 구동 차단 - 모터를 두고 싸우지 않도록
         mgr.set_nav_enabled(False)
         mgr.publish_motor(0.0, 0.0)
+        self._failed = not self._plan_and_start(mgr)
 
-        # 2) 지금 이 순간의 실제 위치를 map 프레임에서 읽는다
+    def _plan_and_start(self, mgr: 'MissionManager') -> bool:
+        """지금 위치에서 주차 기동을 골라 실행한다. 성공하면 True.
+
+        예전에는 해석해를 한 번 풀어 그대로 실행했다. 그런데 해석해는 기하학만
+        풀 뿐 벽을 모른다 - 실제로 A구역 동측 진입에서 최단해가 구조물을
+        관통하는 곡선이었고 차가 그대로 따라갔다.
+        이제는 collision.plan_parking이 후보를 여럿 만들어 지도 스윕 검사를
+        통과한 것만 고른다. 자세한 배경은 collision.py 머리말에.
+        """
         cur_map = mgr.map_pose()
         if cur_map is None:
             mgr.log('  map->base_link TF를 못 읽음. 주차 불가')
-            self._failed = True
-            return
-        self._failed = False
+            return False
 
-        # 3) 슬롯 좌표계로 옮겨서 목표를 (0,0,0)으로 만든 뒤 해석적으로 푼다
+        checker = mgr.footprint_checker()
+        if checker is None:
+            mgr.log('  지도 미수신 - 충돌 검사 없이 기본 해로 진행')
+
         start_slot = to_slot_frame(cur_map, self.slot.slot_pose)
-        ideal = self.slot.staging_slot_frame()
         mgr.log('  실제 진입 %s' % cur_map)
-        mgr.log('  슬롯좌표 %s (이상 %s)' % (start_slot, ideal))
+        mgr.log('  슬롯좌표 %s (이상 %s)'
+                % (start_slot, self.slot.staging_slot_frame()))
 
-        if self.slot.kind == 'perpendicular':
-            prims = solve_perpendicular(start_slot, self.slot.radius)
-            if prims is None:
-                # 이미 슬롯 축과 나란하면 원호 분해가 특이점이 된다. 직선으로 충분.
-                mgr.log('  이미 슬롯 축과 나란함 -> 직선 후진으로 축약')
-                prims = solve_straight_only(start_slot)
-        elif self.slot.straight_first:
-            # 슬롯 축 위에 장애물이 있는 경우. 진입 높이를 유지한 채 지나친 뒤
-            # 내려온다 (A구역의 x=1.30 벽 때문에 필요하다).
-            prims = solve_parallel_straight_first(start_slot, self.slot.radius)
-            if prims is None:
-                mgr.log('  직선우선 해가 없어 기본 순서로 재시도')
-                prims = solve_parallel(start_slot, self.slot.radius)
-        else:
-            prims = solve_parallel(start_slot, self.slot.radius)
+        plan = plan_parking(checker, cur_map, self.slot)
 
-        if prims is None:
-            mgr.log('  기동 해를 찾지 못함. 진입 위치가 너무 벗어난 듯')
-            self._failed = True
-            return
+        if plan is None:
+            # 여기서 바로 실패로 끝내지 않는다. 지금 자리에서 슬롯으로 들어가는
+            # 길이 전부 막혔다는 뜻일 뿐, 진입점으로 옮겨 다시 풀면 되는 경우가
+            # 많다. 사람이 각이 안 나올 때 차를 빼서 다시 대는 것과 같다.
+            if self._aligned:
+                mgr.log('  정렬 후에도 벽을 피하는 주차 기동이 없음. 주차 실패')
+                return False
+            staging = cfg.staging_pose_map(self.slot)
+            align = plan_align(checker, cur_map, staging)
+            if align is None:
+                mgr.log('  벽을 피하는 주차 기동이 없고 진입점 정렬도 불가. 주차 실패')
+                return False
+            mgr.log('  벽을 피하는 주차 기동 없음 -> 진입점 %s 로 정렬 후 재시도'
+                    % staging)
+            mgr.log('  정렬 기동: %s' % align.describe())
+            self._phase = 'align'
+            self._aligned = True
+            mgr.publish_maneuver(cur_map, align.prims, align.radius, None)
+            mgr.executor_.cfg.turn_radius = align.radius
+            mgr.executor_.start(align.prims, tag='%s정렬' % self.slot.name)
+            return True
 
-        # 4) 푼 해가 실제로 목표에 닿는지 자체 검산 (풀고 나서 반드시 확인)
-        end = integrate(start_slot, prims, self.slot.radius)
-        residual = math.hypot(end.x, end.y)
-        if residual > 0.02 or abs(wrap_angle(end.yaw)) > math.radians(2.0):
-            mgr.log('  해 검산 실패: 잔차 %.3fm / %.1fdeg'
-                    % (residual, math.degrees(wrap_angle(end.yaw))))
-            self._failed = True
-            return
-        mgr.log('  해 검산 OK: 잔차 %.4fm, 총 %.2fm' % (residual, total_length(prims)))
+        mgr.log('  주차 기동 채택: %s' % plan.describe())
 
-        # 5) RViz로 눈으로 볼 수 있게 계획 경로를 발행 (전진=초록/후진=주황)
-        mgr.publish_maneuver(cur_map, prims, self.slot.radius, self.slot.slot_pose)
+        # RViz로 눈으로 볼 수 있게 계획 경로를 발행 (전진=초록/후진=주황)
+        mgr.publish_maneuver(cur_map, plan.prims, plan.radius,
+                             self.slot.slot_pose)
 
-        # 6) 탈출 때 되짚어 쓸 수 있게 보관
-        mgr.last_park_prims = prims
-        mgr.last_park_radius = self.slot.radius
+        # 탈출 때 되짚어 쓸 수 있게 보관. 반경도 함께 - 후보 중에서 골랐으므로
+        # slot.radius와 다를 수 있고, 다른 반경으로 되짚으면 경로가 어긋난다.
+        mgr.last_park_prims = plan.prims
+        mgr.last_park_radius = plan.radius
 
-        mgr.executor_.cfg.turn_radius = self.slot.radius
-        mgr.executor_.start(prims, tag=self.slot.name)
+        self._phase = 'park'
+        mgr.executor_.cfg.turn_radius = plan.radius
+        mgr.executor_.start(plan.prims, tag=self.slot.name)
+        return True
 
     def update(self, mgr: 'MissionManager') -> str:
         if self._failed:
             return FAILED
+
+        if self._phase == 'align':
+            st = mgr.executor_.state
+            if st not in (EX_DONE, EX_FAILED):
+                return RUNNING
+            if st == EX_FAILED:
+                mgr.log('  정렬 기동이 중단됨 - 그 자리에서 주차를 다시 풀어본다')
+            # 정렬이 끝났든 중간에 멈췄든, 지금 위치에서 다시 푸는 게 맞다.
+            if not self._plan_and_start(mgr):
+                return FAILED
+            return RUNNING
+
         st = mgr.executor_.state
         if st == EX_FAILED:
-            # 본 기동이 중단됐으면 주차 자체가 안 된 것이라 실패다.
-            # 하지만 '보정' 기동이 중단된 거라면 이야기가 다르다. 이미 슬롯 안에
-            # 들어가 있고 다듬는 중이었을 뿐이므로, 조금 삐뚤어진 채로 끝내는 게
-            # 미션 전체를 포기하는 것보다 낫다. (초음파가 벽을 잡고 멈추는 건
-            # 정상 동작이고, 그때마다 미션이 죽으면 안 된다)
+            # '보정' 기동이 중단된 거라면 이미 슬롯 안에 들어가 있고 다듬는
+            # 중이었을 뿐이다. 조금 삐뚤어진 채로 끝내는 게 낫다.
             if self._corrections > 0:
                 mgr.log('  보정 %d회차가 중단됨 - 현 위치로 주차 종료'
                         % self._corrections)
                 return DONE
-            return FAILED
-        if st != EX_DONE:
+
+            # 본 기동이 중단된 경우. 예전에는 무조건 실패로 처리해 미션을
+            # 끝냈는데, 그게 잘못이었다. 후방 초음파가 잡는 시점은 늘 기동의
+            # 74~83% 지점, 즉 슬롯에 거의 다 들어가 벽에 가까워지는 것이
+            # 정상인 국면이다. 거기서 미션을 통째로 버릴 이유가 없다.
+            #
+            #   [INFO] 정지: 후방 0.23m (정지선 0.25m)
+            #   [INFO] 기동 중단: 후방 장애물이 6s간 유지됨
+            #   [INFO] 스텝 실패: B구역 주차
+            #   [INFO] === 미션 실패 ===
+            #
+            # 그래서 얼마나 갔는지로 가른다. 많이 갔으면 그 자리를 주차로 보고
+            # 아래 평가/보정 경로로 넘긴다. 초반에 막힌 거라면 진짜 실패다.
+            prog = mgr.executor_.progress()
+            if prog < mgr.park_min_progress:
+                mgr.log('  본 기동이 %.0f%% 지점에서 중단됨 (기준 %.0f%%) - 주차 실패'
+                        % (100.0 * prog, 100.0 * mgr.park_min_progress))
+                return FAILED
+            mgr.log('  본 기동이 %.0f%% 진행 후 중단됨 - 현 위치를 주차로 보고 '
+                    '남은 오차는 보정으로 다듬는다' % (100.0 * prog))
+            # 아래 평가/보정 경로로 그대로 떨어진다
+        elif st != EX_DONE:
             return RUNNING
 
         # 기동이 끝났다. 실제로 얼마나 맞았는지 확인하고, 남으면 한 번 더 다듬는다.
@@ -446,14 +549,27 @@ class ParkStep(Step):
             mgr.log('  보정 %d회 소진. 현 상태로 종료' % self._corrections)
             return DONE
 
-        prims = solve_correction(err, self.slot.radius)
+        radius = mgr.last_park_radius or self.slot.radius
+        prims = solve_correction(err, radius)
         if prims is None:
             mgr.log('  보정 기동 해 없음. 현 상태로 종료')
             return DONE
 
+        # 보정도 벽을 지날 수 있다. 슬롯 안이라 폭이 좁고, 잔차를 지우려고
+        # 옆으로 미는 2원호가 그대로 벽을 향하는 경우가 있다. 조금 삐뚤어진
+        # 채로 끝내는 편이 벽에 닿는 것보다 낫다.
+        checker = mgr.footprint_checker()
+        if checker is not None:
+            worst, at = checker.sweep(cur, prims, radius)
+            if worst < 0.0:
+                where = ' @%.2f,%.2f' % at if at else ''
+                mgr.log('  보정 기동이 벽에 닿음 (여유 %+.3fm%s). 현 상태로 종료'
+                        % (worst, where))
+                return DONE
+
         self._corrections += 1
         mgr.log('  보정 %d회차 (%.2fm)' % (self._corrections, total_length(prims)))
-        mgr.publish_maneuver(cur, prims, self.slot.radius, self.slot.slot_pose)
+        mgr.publish_maneuver(cur, prims, radius, self.slot.slot_pose)
         mgr.executor_.start(prims, tag='%s보정%d' % (self.slot.name, self._corrections))
         return RUNNING
 
@@ -495,6 +611,110 @@ class ExitStep(Step):
         return RUNNING
 
 
+class HomeStep(Step):
+    """출발지점 정밀 복귀.
+
+    LegStep이 Nav2로 출발지 근처까지 데려다 놓으면, 여기서 남은 오차를 직접
+    지운다. 주차와 같은 방식이다 - 도착한 실제 pose를 읽어 출발 pose까지 가는
+    기동을 해석적으로 풀고 모터를 직접 잡는다.
+
+    왜 Nav2에 맡기지 않나
+    --------------------
+    goal checker의 yaw_goal_tolerance가 3.15 rad(사실상 무검사)이기 때문이다.
+    그건 경유점 때문에 반드시 그래야 하는 값이다(Ackermann은 제자리 회전이 안
+    되므로 방위를 요구하면 목표를 영원히 못 만족한다). 그 설정 그대로 최종
+    복귀까지 끝내면 차가 비스듬히 선 채로 미션이 '완료'된다. 실제로 그랬다.
+
+    goal checker를 목표마다 바꾸는 방법도 있지만(BT에서 goal_checker_id 지정),
+    이미 검증된 기동 실행기가 있으므로 그쪽을 쓰는 편이 단순하고 확실하다.
+    """
+
+    name = '출발지점 정밀 복귀'
+
+    def enter(self, mgr: 'MissionManager') -> None:
+        self._corrections = 0
+        self._done = False
+        # 모터를 직접 잡으므로 Nav2 구동을 끊는다 (주차 기동과 같은 이유)
+        mgr.set_nav_enabled(False)
+        mgr.publish_motor(0.0, 0.0)
+        self._align(mgr, first=True)
+
+    def _align(self, mgr: 'MissionManager', first: bool) -> None:
+        """남은 오차를 재고, 남아 있으면 정렬 기동을 하나 시작한다."""
+        cur = mgr.map_pose()
+        if cur is None:
+            mgr.log('  map->base_link TF를 못 읽음. 정렬 생략')
+            self._done = True
+            return
+
+        # 출발 pose를 원점으로 하는 좌표계로 옮기면 목표가 (0,0,0)이 된다.
+        # 주차에서 슬롯 좌표계를 쓰는 것과 같은 수법이다.
+        err = to_slot_frame(cur, cfg.START_POSE)
+        mgr.log('  현재 %s' % cur)
+        mgr.log('  출발지 대비 종/횡 %.3f/%.3f m, 방위 %.1fdeg'
+                % (err.x, err.y, math.degrees(err.yaw)))
+
+        if (abs(err.x) <= cfg.HOME_POS_TOL and abs(err.y) <= cfg.HOME_POS_TOL
+                and abs(err.yaw) <= cfg.HOME_YAW_TOL):
+            mgr.log('  복귀 완료 (허용오차 이내)')
+            self._done = True
+            return
+
+        if not first and self._corrections >= cfg.HOME_MAX_CORRECTIONS:
+            # 여기서 실패 처리하지 않는다. 미션은 이미 끝났고, 조금 어긋난 복귀가
+            # 보정을 반복하다 시간을 다 쓰는 것보다 낫다. (주차와 같은 판단)
+            mgr.log('  정렬 %d회 소진. 현 상태로 종료' % self._corrections)
+            self._done = True
+            return
+
+        # 좁은 한계부터 시도하고, 해가 없을 때만 넓힌다. 작은 잔차를 큰 기동으로
+        # 지우면 기동 자체의 실행 오차가 새 오차를 만든다(mission_config 주석 참고).
+        prims = None
+        for max_arc, max_length in cfg.HOME_SOLVE_STAGES:
+            prims = solve_correction(err, cfg.HOME_RADIUS,
+                                     max_arc=max_arc, max_length=max_length)
+            if prims is not None:
+                mgr.log('  해 탐색: 원호한계 %.0f도 / 거리한계 %.1fm 단계에서 성공'
+                        % (math.degrees(max_arc), max_length))
+                break
+        if prims is None:
+            mgr.log('  정렬 기동 해 없음. 현 상태로 종료')
+            self._done = True
+            return
+
+        # 푼 해가 실제로 목표에 닿는지 검산 (주차와 같은 절차)
+        end = integrate(err, prims, cfg.HOME_RADIUS)
+        residual = math.hypot(end.x, end.y)
+        if residual > 0.02 or abs(wrap_angle(end.yaw)) > math.radians(2.0):
+            mgr.log('  해 검산 실패: 잔차 %.3fm / %.1fdeg. 현 상태로 종료'
+                    % (residual, math.degrees(wrap_angle(end.yaw))))
+            self._done = True
+            return
+
+        if not first:
+            self._corrections += 1
+        mgr.log('  정렬 기동 %d회차 (%.2fm)'
+                % (self._corrections, total_length(prims)))
+        mgr.publish_maneuver(cur, prims, cfg.HOME_RADIUS, cfg.START_POSE)
+        mgr.executor_.cfg.turn_radius = cfg.HOME_RADIUS
+        mgr.executor_.start(prims, tag='복귀%d' % self._corrections)
+
+    def update(self, mgr: 'MissionManager') -> str:
+        if self._done:
+            return DONE
+        st = mgr.executor_.state
+        if st == EX_FAILED:
+            # 초음파가 뒤를 잡아 멈추는 건 정상 동작이다. 복귀가 조금 어긋나는
+            # 것이 미션을 실패로 끝내는 것보다 낫다.
+            mgr.log('  정렬 기동 중단. 현 위치로 종료')
+            return DONE
+        if st != EX_DONE:
+            return RUNNING
+        # 기동이 끝났다. 다시 재서 남아 있으면 한 번 더.
+        self._align(mgr, first=False)
+        return DONE if self._done else RUNNING
+
+
 class DwellStep(Step):
     """제자리 정차. 주차 판정 여유를 준다."""
 
@@ -530,8 +750,21 @@ class MissionManager(Node):
         # 통행 감시
         self.declare_parameter('check_period', 1.0)      # 판정 주기 (s)
         self.declare_parameter('blocked_confirm', 2)     # 연속 몇 번 막혀야 확정
+        # 막힌 지점이 이 거리 안으로 들어와야 경로 전환을 검토한다.
+        # 멀리서 본 장애물로 성급하게 포기하지 않기 위한 것.
+        self.declare_parameter('block_min_distance', 1.2)
         self.declare_parameter('pass_margin', 0.07)      # 반폭에 더할 여유 (m)
-        self.declare_parameter('pass_band', 0.75)        # 중심선에서 허용 이탈 (m)
+        # 중심선에서 이만큼까지 벗어나는 것은 '같은 경로'로 본다.
+        #
+        # 0.75로 뒀더니 통로를 통째로 벗어난 우회로도 '통과 가능'으로 나왔다.
+        # 북측 통로 폭이 0.70m(반폭 0.35)인데 0.75를 허용하면 옆 통로까지
+        # 탐색 범위에 들어오기 때문이다. 실제로 로그에 '중심선에서 0.69m
+        # 비켜감'이 찍히면서, 북측이 막혔는데도 서쪽으로 새는 경로를 통과
+        # 가능이라 판정해 2순위로 전환하지 않았다.
+        #
+        # 0.40이면 통로 안에서 장애물을 비켜갈 여유는 주되, 통로를 벗어나면
+        # '이 경로는 막혔다'고 판정한다.
+        self.declare_parameter('pass_band', 0.40)
         # 중간 경유점을 이 반경 안으로 지나가면 '통과'로 보고 다음으로 넘어간다.
         # Nav2 목표는 '정확히 그 자리에 서기'라 경유점마다 정차하게 되는데,
         # 경유점은 통과점일 뿐이라 그럴 이유가 없다. 멈췄다 다시 서는 동작이
@@ -543,8 +776,14 @@ class MissionManager(Node):
         # 초음파 후방 감시
         self.declare_parameter('ultrasonic_topic', '/xycar_ultrasonic')
         self.declare_parameter('use_ultrasonic', True)
-        self.declare_parameter('ultra_stop_distance', 0.25)
-        self.declare_parameter('ultra_slow_distance', 0.40)
+        # 근거는 ultrasonic.py GuardConfig 주석의 실측 표 참고.
+        self.declare_parameter('ultra_stop_distance', 0.18)
+        self.declare_parameter('ultra_slow_distance', 0.30)
+
+        # 본 주차 기동이 중단됐을 때, 이 비율 이상 진행됐으면 '거기까지 주차한
+        # 것'으로 보고 남은 오차는 보정 기동으로 처리한다. 그 미만이면 진짜
+        # 실패다. 후방 정지는 늘 기동의 74~83%에서 걸리므로 0.60이면 갈린다.
+        self.declare_parameter('park_min_progress', 0.60)
 
         # 기동 튜닝값 (motion.MotionConfig 기본값을 파라미터로 덮어쓸 수 있게)
         self.declare_parameter('park_speed', 0.30)
@@ -567,10 +806,14 @@ class MissionManager(Node):
 
         self.check_period = float(self.get_parameter('check_period').value)
         self.blocked_confirm = int(self.get_parameter('blocked_confirm').value)
+        self.block_min_distance = float(
+            self.get_parameter('block_min_distance').value)
         self._pass_margin = float(self.get_parameter('pass_margin').value)
         self._pass_band = float(self.get_parameter('pass_band').value)
         self.wp_pass_radius = float(
             self.get_parameter('waypoint_pass_radius').value)
+        self.park_min_progress = float(
+            self.get_parameter('park_min_progress').value)
 
         self._static_map: Optional[OccupancyGrid] = None
         self._obs_grid: Optional[OccupancyGrid] = None
@@ -646,6 +889,10 @@ class MissionManager(Node):
             steps.append(ExitStep('%s구역 탈출' % slot.name,
                                   slot.exit_arc_fraction))
         steps.append(LegStep(cfg.LEG_B_TO_START))
+        # Nav2는 xy 0.20m / yaw 무검사로 끝난다. 출발 좌표 그대로 서려면
+        # 주차와 같은 방식으로 한 번 더 다듬어야 한다.
+        steps.append(HomeStep())
+        steps.append(DwellStep('출발지점 정차', cfg.HOME_DWELL_SEC))
         return steps
 
     # -- 보조 --------------------------------------------------------------
@@ -698,29 +945,55 @@ class MissionManager(Node):
     def _on_obs_grid(self, msg: OccupancyGrid) -> None:
         self._obs_grid = msg
 
-    def check_route(self, route, from_index: int):
-        """이 경로의 남은 구간이 아직 통과 가능한가.
+    def build_grid(self):
+        """정적 지도(/map) + 실시간 감지 장애물(/obstacles/grid)을 겹친 격자.
 
-        정적 지도(/map)와 실시간 감지 장애물(/obstacles/grid)을 겹쳐서 판정한다.
-        지도를 아직 못 받았으면 None을 돌려주고, 호출한 쪽은 판정을 건너뛴다
-        (지도가 없다는 이유로 경로를 포기하면 안 된다).
+        통행 판정(check_route)과 주차 기동 충돌 검사(collision.py)가 같은 격자를
+        쓴다. 그래야 '통로에서는 피해 갔는데 주차하다 들이받는' 불일치가 없다.
+        지도를 아직 못 받았으면 None.
+
+        만드는 비용이 싸지 않다(21k셀 집합 + 거리변환 2패스). 주차 계획은 한 번에
+        여러 후보를 스윕하느라 이걸 연속으로 부르므로, 입력이 그대로면 만들어둔
+        것을 다시 쓴다. 새 장애물 메시지가 오면 자동으로 다시 만든다.
         """
         if self._static_map is None:
             return None
-        cur = self.map_pose()
-        if cur is None:
-            return None
-
+        # 메시지 객체를 그대로 들고 비교한다(is). id()로 비교하면 옛 메시지가
+        # 회수된 자리에 새 메시지가 잡혔을 때 같은 값이 나와 오판할 수 있다.
+        cached = getattr(self, '_grid_key', None)
+        if (cached is not None and cached[0] is self._static_map
+                and cached[1] is self._obs_grid):
+            return self._grid_cache
         m = self._static_map
         info = GridInfo(m.info.width, m.info.height, m.info.resolution,
                         m.info.origin.position.x, m.info.origin.position.y)
         grid = PassabilityGrid.from_arrays(info, m.data)
-
         if self._obs_grid is not None and self._obs_grid.info.width == info.width:
             w = info.width
             grid.add_obstacle_cells(
                 (i % w, i // w)
                 for i, v in enumerate(self._obs_grid.data) if v >= 50)
+        self._grid_key = (self._static_map, self._obs_grid)
+        self._grid_cache = grid
+        return grid
+
+    def footprint_checker(self) -> Optional[FootprintChecker]:
+        """주차 기동 스윕 검사기. 지도가 없으면 None (검사를 건너뛴다)."""
+        grid = self.build_grid()
+        return None if grid is None else FootprintChecker(grid)
+
+    def check_route(self, route, from_index: int):
+        """이 경로의 남은 구간이 아직 통과 가능한가.
+
+        지도를 아직 못 받았으면 None을 돌려주고, 호출한 쪽은 판정을 건너뛴다
+        (지도가 없다는 이유로 경로를 포기하면 안 된다).
+        """
+        grid = self.build_grid()
+        if grid is None:
+            return None
+        cur = self.map_pose()
+        if cur is None:
+            return None
 
         poly = remaining_polyline(
             (cur.x, cur.y),
@@ -834,3 +1107,4 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
+
