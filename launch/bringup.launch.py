@@ -44,6 +44,11 @@ def generate_launch_description():
     rviz_config = LaunchConfiguration('rviz_config')
     publish_lidar_tf = LaunchConfiguration('publish_lidar_tf')
     use_obstacle_monitor = LaunchConfiguration('use_obstacle_monitor')
+    use_fake_hardware = LaunchConfiguration('use_fake_hardware')
+    sim_radius_err = LaunchConfiguration('sim_radius_err')
+    sim_steer_bias = LaunchConfiguration('sim_steer_bias')
+    sim_servo_lag = LaunchConfiguration('sim_servo_lag')
+    sim_obstacles = LaunchConfiguration('sim_obstacles')
 
     declares = [
         DeclareLaunchArgument(
@@ -56,6 +61,23 @@ def generate_launch_description():
         DeclareLaunchArgument('use_rviz', default_value='true'),
         DeclareLaunchArgument('rviz_config', default_value=default_rviz),
         DeclareLaunchArgument('use_obstacle_monitor', default_value='true'),
+        DeclareLaunchArgument(
+            'use_fake_hardware', default_value='false',
+            description='true: 라이다/VESC/초음파를 가상 노드로 대신한다. '
+                        '실차 없이 미션 전체를 돌려보기 위한 것이고, '
+                        '실차에서는 반드시 false여야 한다'),
+        DeclareLaunchArgument(
+            'sim_radius_err', default_value='1.0',
+            description='가상 하드웨어: 실제 회전반경 / 설계 회전반경. '
+                        '1.15면 15% 덜 꺾인다'),
+        DeclareLaunchArgument('sim_steer_bias', default_value='0.0',
+                              description='가상 하드웨어: 조향 영점 오차 (deg)'),
+        DeclareLaunchArgument('sim_servo_lag', default_value='0.0',
+                              description='가상 하드웨어: 서보 지연 시간상수 (s)'),
+        DeclareLaunchArgument(
+            'sim_obstacles', default_value='',
+            description='가상 하드웨어: 지도에 없는 장애물. "x,y;x,y" 형식. '
+                        '예 sim_obstacles:="0.9,3.6;1.0,3.6"'),
         DeclareLaunchArgument(
             'publish_lidar_tf', default_value='true',
             description='base_link->laser_frame 정적 TF를 여기서 발행. '
@@ -113,6 +135,20 @@ def generate_launch_description():
         condition=IfCondition(use_obstacle_monitor),
     )
 
+    # 라이다/VESC/초음파를 대신한다. /xycar_motor를 받아 차를 굴리고 /scan을 만들어
+    # 내므로 루프가 닫힌다. 실차에서는 절대 켜지 말 것 - 진짜 센서와 충돌한다.
+    fake_hardware = Node(
+        package='parking_mission', executable='fake_hardware',
+        name='fake_hardware', output='screen',
+        parameters=[{
+            'radius_err': sim_radius_err,
+            'steer_bias': sim_steer_bias,
+            'servo_lag': sim_servo_lag,
+            'obstacles': sim_obstacles,
+        }],
+        condition=IfCondition(use_fake_hardware),
+    )
+
     rviz = Node(
         package='rviz2', executable='rviz2', name='rviz2', output='screen',
         arguments=['-d', rviz_config],
@@ -120,4 +156,5 @@ def generate_launch_description():
     )
 
     return LaunchDescription(
-        declares + nav2_nodes + [lidar_tf, cmd_vel_bridge, obstacle_monitor, rviz])
+        declares + nav2_nodes
+        + [lidar_tf, cmd_vel_bridge, obstacle_monitor, fake_hardware, rviz])

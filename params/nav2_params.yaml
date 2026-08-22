@@ -131,16 +131,35 @@ controller_server:
 
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      required_movement_radius: 0.3
-      movement_time_allowance: 15.0
+      # 좁은 통로를 저속으로 통과하는 구간이 있어 0.3m/15s는 빡빡하다.
+      # 실제로 통로에서 감속하다 progress 실패로 중단되는 일이 있었다.
+      required_movement_radius: 0.15
+      movement_time_allowance: 20.0
 
     general_goal_checker:
       plugin: "nav2_controller::SimpleGoalChecker"
-      # 진입 pose 정확도가 곧 주차 정확도... 는 아니다. 주차 기동은 도착한
-      # 실제 위치에서 다시 풀기 때문에 여기가 조금 벗어나도 흡수된다.
-      # 그래서 무리하게 조이지 않는다 (조이면 Nav2가 목표 근처에서 헤맨다).
-      xy_goal_tolerance: 0.12
-      yaw_goal_tolerance: 0.15
+      xy_goal_tolerance: 0.20
+
+      # ⚠️ yaw는 사실상 검사하지 않는다(3.15 rad = 180도). 반드시 이래야 한다.
+      #
+      # 0.15 rad(8.6도)로 뒀더니 첫 경유점에서 미션이 멈췄다:
+      #     경유점 1/7 목표 yaw 98.1도 / 차량 실제 114.6도 -> 16.5도 부족
+      #     위치는 1.6cm로 도착했는데 방위가 모자라 목표 미달
+      #     controller_server [ERROR]: Failed to make progress
+      #     behavior_server: Running spin ... (무한 반복)
+      #
+      # Ackermann 차량은 제자리 회전을 못 한다. 목표 위치에 이미 도착한 뒤
+      # 방위만 16도 고치는 것은 물리적으로 불가능하다(앞뒤로 호를 그려야 하는데
+      # RPP는 목표 지점에서 그런 기동을 하지 않는다). 그래서 영원히 만족하지
+      # 못하고 복구 동작만 반복한다.
+      #
+      # 방위를 포기해도 되는 이유:
+      #   - 경유점은 통과점일 뿐이다. 방위를 맞출 이유가 없다.
+      #   - 최종 진입 지점은 그 앞 0.45m에 '예비 경유점'을 같은 방위로 두었으므로
+      #     차가 자연스럽게 그 방향으로 들어온다.
+      #   - 주차 기동은 도착한 실제 pose에서 매번 새로 푼다. 진입 방위가 십수 도
+      #     틀어져 있어도 해가 그대로 나온다(geometry.py self-test로 검증).
+      yaw_goal_tolerance: 3.15
       stateful: true
 
     FollowPath:
@@ -153,8 +172,25 @@ controller_server:
       min_approach_linear_velocity: 0.1
       approach_velocity_scaling_dist: 0.5
       use_regulated_linear_velocity_scaling: true
-      use_cost_regulated_linear_velocity_scaling: true
+
+      # ⚠️ 비용 기반 감속을 끈다.
+      # 우리 통로는 폭이 0.70m / 0.50m라 팽창 후에는 전 구간이 고비용이다.
+      # 켜두면 통로 내내 최저속으로 기어가다 progress checker에 걸린다.
+      # 곡률 기반 감속(use_regulated_linear_velocity_scaling)은 유지하므로
+      # 코너에서는 여전히 줄인다.
+      use_cost_regulated_linear_velocity_scaling: false
       use_fixed_curvature_lookahead: false
+
+      # 전방 충돌 예측 시간. 기본 1.0초는 0.35m/s에서 35cm를 미리 보는데,
+      # 좁은 통로의 완만한 곡선에서도 팽창 셀을 스쳐 오검출이 난다.
+      #
+      # 0.4로도 아래가 남아 있다:
+      #     RegulatedPurePursuitController detected collision ahead!
+      #     [follow_path] Aborting handle
+      # 미션은 완주하므로 치명적이진 않고, 복구 동작을 한 번 돌면서 느려지는
+      # 수준이다. 0.3이면 10cm 앞만 보므로 오검출이 더 준다. 그래도 실제
+      # 장애물은 초음파(후방)와 costmap(전방)이 잡는다.
+      max_allowed_time_to_collision_up_to_carrot: 0.3
 
       # Ackermann 차량은 제자리 회전이 물리적으로 불가능하다.
       # 또한 use_rotate_to_heading과 allow_reversing은 동시에 true일 수 없다
@@ -175,12 +211,33 @@ behavior_server:
     local_footprint_topic: local_costmap/published_footprint
     global_footprint_topic: global_costmap/published_footprint
     cycle_frequency: 10.0
-    # Spin(제자리 회전)은 Ackermann 차량이 수행 불가하므로 제외한다.
-    behavior_plugins: ["backup", "wait"]
+
+    # ⚠️ spin을 빼면 bt_navigator가 아예 뜨지 않는다.
+    #
+    # Ackermann은 제자리 회전이 불가하니 spin을 빼는 게 맞다고 생각해 제외했더니
+    # bt_navigator가 이렇게 죽었다:
+    #     "spin" action server not available after waiting for 1.00s
+    #     Error loading XML file: navigate_through_poses_w_replanning_and_recovery.xml
+    #     Failed to bring up all requested nodes. Aborting bringup.
+    #
+    # Nav2 기본 Behavior Tree XML이 Spin 액션을 참조하기 때문에, 서버가 없으면
+    # BT 로드 자체가 실패한다. 그래서 '서버는 띄우되 실제로는 무해하게' 둔다.
+    #
+    # 실제로 spin이 호출돼도 이 차는 움직이지 않는다. cmd_vel_bridge가
+    # |linear.x| < 1e-3이면 조향과 속도를 모두 0으로 내보내기 때문이다.
+    # 즉 복구 동작이 제자리 회전을 시도하면 그냥 시간만 쓰고 넘어간다.
+    # 차가 엉뚱하게 도는 일은 없다.
+    behavior_plugins: ["spin", "backup", "drive_on_heading", "wait", "assisted_teleop"]
+    spin:
+      plugin: "nav2_behaviors/Spin"
     backup:
       plugin: "nav2_behaviors/BackUp"
+    drive_on_heading:
+      plugin: "nav2_behaviors/DriveOnHeading"
     wait:
       plugin: "nav2_behaviors/Wait"
+    assisted_teleop:
+      plugin: "nav2_behaviors/AssistedTeleop"
 
 bt_navigator:
   ros__parameters:
@@ -189,6 +246,13 @@ bt_navigator:
     robot_base_frame: base_link
     odom_topic: /vesc_odom
     transform_tolerance: 0.5
+
+    # 기본 10ms(100Hz)로는 이 보드에서 BT 루프가 못 따라간다.
+    #     [bt_navigator] [WARN]: Behavior Tree tick rate 100.00 was exceeded
+    # 20ms(50Hz)면 충분하다. BT는 액션 상태를 확인하는 일이 전부라
+    # 제어 주기(20Hz)보다 빠르기만 하면 된다.
+    bt_loop_duration: 20
+    default_server_timeout: 20
 
 local_costmap:
   local_costmap:
@@ -222,10 +286,31 @@ local_costmap:
           obstacle_min_range: 0.0
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 3.0
-        # 중앙통로 폭이 0.90m, 차폭 0.30m -> 좌우 여유 0.30m씩.
-        # inflation_radius를 0.3 이상 주면 통로가 통째로 막혀 경로가 안 나온다.
-        inflation_radius: 0.22
+        # 감쇠를 가파르게 해서 벽 바로 옆만 비싸고 조금만 떨어져도 싸지게 한다.
+        cost_scaling_factor: 10.0
+
+        # ⚠️ 이 값이 곧 '253(inscribed) 띠'의 두께이고, RPP는 footprint 아래
+        # 253 셀이 하나라도 있으면 충돌로 판정한다.
+        #
+        # 0.22로 뒀더니 북측/서측 통로를 영원히 못 지나갔다:
+        #     RegulatedPurePursuitController detected collision ahead!
+        #     -> follow_path Aborting -> costmap clear -> spin -> 반복
+        #
+        # 산술이 이렇다. 중심선에서 d만큼 벗어났을 때
+        #     차체 가장자리~벽 = (통로반폭 - 차량반폭 0.15 - d)
+        # 이 값이 inflation_radius보다 작으면 충돌이다.
+        #
+        #   통로   자유폭  반폭   0.22일 때 허용 d   0.08일 때
+        #   북측   0.70   0.35   -0.02 (항상 충돌)   +0.12
+        #   서측   0.50   0.25   -0.12 (항상 충돌)   +0.02
+        #   동측   1.00   0.50   +0.13              +0.27
+        #
+        # 즉 0.22는 "완벽히 가운데로 가도 통과 불가"였다.
+        #
+        # 0.08이면 북측은 12cm까지 벗어나도 되고(AMCL 오차 ~5cm), 서측은
+        # 2cm뿐이라 여전히 아슬아슬하다. 서측 자유폭이 0.50m, 차폭이 0.30m라
+        # 좌우 10cm씩이 물리적 전부이므로 이건 설정으로 더 못 늘린다.
+        inflation_radius: 0.08
       always_send_full_costmap: true
 
 global_costmap:
@@ -259,6 +344,6 @@ global_costmap:
           obstacle_min_range: 0.0
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 3.0
-        inflation_radius: 0.22
+        cost_scaling_factor: 10.0
+        inflation_radius: 0.08   # local_costmap과 같은 이유 (위 주석 참고)
       always_send_full_costmap: true

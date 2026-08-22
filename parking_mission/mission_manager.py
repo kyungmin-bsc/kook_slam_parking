@@ -59,9 +59,11 @@ from .geometry import (
     Pose2D,
     from_slot_frame,
     integrate,
+    partial_exit,
     reverse_prims,
     sample_path,
     solve_parallel,
+    solve_parallel_straight_first,
     solve_correction,
     solve_perpendicular,
     solve_straight_only,
@@ -226,10 +228,25 @@ class LegStep(Step):
             self._goal_handle = None
             return self._switch_route(mgr, '통과 불가 판정')
 
+        # 중간 경유점 통과 판정 - 반경 안에 들어오면 목표를 취소하고 다음으로.
+        # 마지막 경유점(진입 지점)은 정확히 서야 하므로 제외한다.
+        route = self.leg.routes[self._ri]
+        if (self._goal_handle is not None and not self._cancelling
+                and self._wi < len(route.waypoints) - 1):
+            cur = mgr.map_pose()
+            if cur is not None:
+                tgt = route.waypoints[self._wi]
+                if math.hypot(cur.x - tgt.x, cur.y - tgt.y) <= mgr.wp_pass_radius:
+                    mgr.log('    경유점 %d 통과 (반경 %.2fm 안)'
+                            % (self._wi + 1, mgr.wp_pass_radius))
+                    self._goal_handle.cancel_goal_async()
+                    self._goal_handle = None
+                    self._result_future = None
+                    return self._on_waypoint_reached(mgr)
+
         # 주행 중 통행 감시
         if self._goal_handle is not None and mgr.now() >= self._next_check:
             self._next_check = mgr.now() + mgr.check_period
-            route = self.leg.routes[self._ri]
             verdict = mgr.check_route(route, self._wi)
             if verdict is not None and not verdict.passable:
                 self._blocked_hits += 1
@@ -355,6 +372,13 @@ class ParkStep(Step):
                 # 이미 슬롯 축과 나란하면 원호 분해가 특이점이 된다. 직선으로 충분.
                 mgr.log('  이미 슬롯 축과 나란함 -> 직선 후진으로 축약')
                 prims = solve_straight_only(start_slot)
+        elif self.slot.straight_first:
+            # 슬롯 축 위에 장애물이 있는 경우. 진입 높이를 유지한 채 지나친 뒤
+            # 내려온다 (A구역의 x=1.30 벽 때문에 필요하다).
+            prims = solve_parallel_straight_first(start_slot, self.slot.radius)
+            if prims is None:
+                mgr.log('  직선우선 해가 없어 기본 순서로 재시도')
+                prims = solve_parallel(start_slot, self.slot.radius)
         else:
             prims = solve_parallel(start_slot, self.slot.radius)
 
@@ -435,10 +459,16 @@ class ParkStep(Step):
 
 
 class ExitStep(Step):
-    """직전 주차 기동을 되짚어 슬롯을 빠져나온다."""
+    """직전 주차 기동을 되짚어 슬롯을 빠져나온다.
 
-    def __init__(self, name: str):
+    slot.exit_arc_fraction으로 '어디까지' 되짚을지 정한다. 끝까지 되짚으면
+    진입 때의 방위로 돌아가는데, 그게 다음 목적지 반대쪽이면 나오자마자
+    크게 선회해야 한다. A구역이 그 경우라 절반만 되짚는다.
+    """
+
+    def __init__(self, name: str, fraction: float = 1.0):
         self.name = name
+        self.fraction = fraction
 
     def enter(self, mgr: 'MissionManager') -> None:
         mgr.set_nav_enabled(False)
@@ -447,7 +477,7 @@ class ExitStep(Step):
             self._failed = True
             return
         self._failed = False
-        prims = reverse_prims(mgr.last_park_prims)
+        prims = partial_exit(mgr.last_park_prims, self.fraction)
         mgr.executor_.cfg.turn_radius = mgr.last_park_radius
         cur = mgr.map_pose()
         if cur is not None:
@@ -502,6 +532,11 @@ class MissionManager(Node):
         self.declare_parameter('blocked_confirm', 2)     # 연속 몇 번 막혀야 확정
         self.declare_parameter('pass_margin', 0.07)      # 반폭에 더할 여유 (m)
         self.declare_parameter('pass_band', 0.75)        # 중심선에서 허용 이탈 (m)
+        # 중간 경유점을 이 반경 안으로 지나가면 '통과'로 보고 다음으로 넘어간다.
+        # Nav2 목표는 '정확히 그 자리에 서기'라 경유점마다 정차하게 되는데,
+        # 경유점은 통과점일 뿐이라 그럴 이유가 없다. 멈췄다 다시 서는 동작이
+        # 사라져 훨씬 매끄럽고 빨라진다.
+        self.declare_parameter('waypoint_pass_radius', 0.35)
         self.declare_parameter('map_topic', '/map')
         self.declare_parameter('obstacle_grid_topic', '/obstacles/grid')
 
@@ -534,6 +569,8 @@ class MissionManager(Node):
         self.blocked_confirm = int(self.get_parameter('blocked_confirm').value)
         self._pass_margin = float(self.get_parameter('pass_margin').value)
         self._pass_band = float(self.get_parameter('pass_band').value)
+        self.wp_pass_radius = float(
+            self.get_parameter('waypoint_pass_radius').value)
 
         self._static_map: Optional[OccupancyGrid] = None
         self._obs_grid: Optional[OccupancyGrid] = None
@@ -606,7 +643,8 @@ class MissionManager(Node):
             steps.append(LegStep(leg))
             steps.append(ParkStep(slot))
             steps.append(DwellStep('%s구역 정차' % slot.name, slot.dwell_sec))
-            steps.append(ExitStep('%s구역 탈출' % slot.name))
+            steps.append(ExitStep('%s구역 탈출' % slot.name,
+                                  slot.exit_arc_fraction))
         steps.append(LegStep(cfg.LEG_B_TO_START))
         return steps
 

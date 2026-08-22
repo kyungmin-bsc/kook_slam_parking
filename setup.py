@@ -28,6 +28,7 @@ setup(
             'cmd_vel_bridge = parking_mission.cmd_vel_bridge:main',
             'mission_manager = parking_mission.mission_manager:main',
             'obstacle_monitor = parking_mission.obstacle_monitor:main',
+            'fake_hardware = parking_mission.fake_hardware:main',
         ],
     },
 )

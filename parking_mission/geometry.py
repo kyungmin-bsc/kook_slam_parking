@@ -228,6 +228,24 @@ def reverse_prims(prims: List[Prim]) -> List[Prim]:
     return out
 
 
+def partial_exit(prims: List[Prim], fraction: float) -> List[Prim]:
+    """탈출 기동을 마지막 원호의 fraction만큼만 수행하도록 자른다.
+
+    탈출의 목적은 '슬롯을 안전하게 빠져나오는 것'이지 '진입지점으로 정확히
+    복귀하는 것'이 아니다. 끝까지 되짚으면 진입 때의 방위로 되돌아가는데,
+    그 방위가 다음 목적지 방향과 반대일 수 있다. 그 경우 나오자마자 크게
+    선회해야 해서 좁은 곳에서 헤맨다.
+    """
+    out = reverse_prims(prims)
+    if fraction >= 1.0 or not out:
+        return out
+    f = max(0.05, fraction)
+    last = out[-1]
+    out[-1] = Prim(last.kind, last.length * f, last.turn, last.direction,
+                   last.angle * f, last.label)
+    return out
+
+
 def prims_to_steer(prims: List[Prim], wheelbase: float, radius: float,
                    steer_limit_deg: float) -> List[Tuple[Prim, float]]:
     """각 구간에 실제로 내보낼 조향각(도)을 붙인다.
@@ -423,6 +441,89 @@ def solve_parallel(start: Pose2D, radius: float,
     return best
 
 
+def solve_parallel_straight_first(start: Pose2D, radius: float,
+                                  max_arc: float = math.pi * 0.75,
+                                  direction: int = -1) -> Optional[List[Prim]]:
+    """평행주차인데 직선을 **앞에** 두는 변형: 직선 -> 원호 -> 반대 원호.
+
+    solve_parallel은 [원호, 원호, 직선] 순서라 차가 먼저 옆으로 붙은 뒤 슬롯 축을
+    따라 길게 들어온다. 슬롯 축 위에 장애물이 있으면 그 구간에서 걸린다.
+
+    A구역이 그 경우다. (1.30, 4.10~4.30)에 얇은 벽이 있어서 슬롯 축(y=4.2)을
+    따라 동쪽에서 들어오면 차 앞코가 스친다. 직선을 앞에 두면 차가 진입 높이
+    (y=4.65)를 유지한 채 그 벽을 지나친 뒤에 내려오므로 걸리지 않는다.
+
+    미지수는 (직선길이 a, 원호각 t) 둘이고 방정식은 최종 x, y 둘이다.
+    각 t마다 '원호가 원점에서 끝나려면 원호 시작점이 어디여야 하는가'를 구하고,
+    그 점이 시작 자세의 진행선 위에 있는지를 외적으로 본다. 그 외적이 0이 되는
+    t를 이분법으로 찾고, a는 내적으로 얻는다.
+    """
+    th0 = wrap_angle(start.yaw)
+    d = 1 if direction > 0 else -1
+    ux, uy = math.cos(th0), math.sin(th0)
+
+    best: Optional[List[Prim]] = None
+    best_cost = float('inf')
+
+    for sgn in (1, -1):
+        offset = -th0 / (d * sgn)
+
+        def arc_start_for(t):
+            """원호 2개가 (0,0,0)에서 끝나도록 하는 원호 시작점과 구간들."""
+            phi2 = t
+            phi1 = t + offset
+            if phi1 < -1e-9 or phi2 < -1e-9 or phi1 > max_arc or phi2 > max_arc:
+                return None, None
+            prims = [Prim('C', radius * phi1, sgn, d, phi1, 'swing-in'),
+                     Prim('C', radius * phi2, -sgn, d, phi2, 'straighten')]
+            # 시작 자세를 (0,0,th0)로 두고 적분한 변위를 빼면 시작점이 나온다
+            disp = integrate(Pose2D(0.0, 0.0, th0), prims, radius)
+            if abs(wrap_angle(disp.yaw)) > 1e-6:
+                return None, None
+            return (-disp.x, -disp.y), prims
+
+        def cross(t):
+            p, _ = arc_start_for(t)
+            if p is None:
+                return None
+            vx, vy = p[0] - start.x, p[1] - start.y
+            return vx * uy - vy * ux
+
+        lo = max(0.0, -offset)
+        hi = min(max_arc, max_arc - offset) if offset > 0 else max_arc
+        if hi <= lo:
+            continue
+        flo, fhi = cross(lo), cross(hi)
+        if flo is None or fhi is None or flo * fhi > 0:
+            continue
+        for _ in range(80):
+            mid = 0.5 * (lo + hi)
+            fm = cross(mid)
+            if fm is None:
+                break
+            if flo * fm <= 0:
+                hi, fhi = mid, fm
+            else:
+                lo, flo = mid, fm
+        t = 0.5 * (lo + hi)
+        p, prims = arc_start_for(t)
+        if p is None:
+            continue
+        a = (p[0] - start.x) * ux + (p[1] - start.y) * uy
+        out: List[Prim] = []
+        if abs(a) > 1e-3:
+            out.append(Prim('S', abs(a), 0, 1 if a > 0 else -1, 0.0, 'run-past'))
+        out.extend(prims)
+
+        end = integrate(start, out, radius)
+        if math.hypot(end.x, end.y) > 5e-3 or abs(wrap_angle(end.yaw)) > 1e-3:
+            continue
+        cost = total_length(out)
+        if cost < best_cost:
+            best_cost, best = cost, out
+    return best
+
+
 def solve_straight_only(start: Pose2D) -> List[Prim]:
     """이미 슬롯 축과 거의 나란할 때 쓰는 축약해: 직선 한 구간."""
     b = -start.x
@@ -449,6 +550,14 @@ def solve_correction(start: Pose2D, radius: float,
 
     전진/후진 양쪽을 다 시도해서 짧은 쪽을 고른다. 슬롯 깊숙이 들어가 있을 때
     더 후진하면 안쪽 벽에 닿을 수 있으므로 전진 해가 선택될 여지를 남겨둔다.
+
+    보정 기동의 크기는 잔차 크기에 맞춘다.
+
+    "찔끔거리지 말고 확실하게 크게 움직이면 빠르지 않나"를 실제로 시험해봤다
+    (원호 최소 18도 강제). 결과는 반대였다 - 보정 횟수는 2~3회에서 0~1회로
+    줄었지만 최종 오차가 0.9cm에서 13cm로 나빠졌다. 잔차가 3cm인데 0.8m를
+    움직이면 그 기동 자체의 실행 오차(반경 오차 15%)가 새 오차를 만들기
+    때문이다. 그래서 최소 원호 강제는 넣지 않는다.
     """
     if abs(start.y) <= lat_tol and abs(wrap_angle(start.yaw)) <= math.radians(3.0):
         prims = solve_straight_only(start)
@@ -457,7 +566,8 @@ def solve_correction(start: Pose2D, radius: float,
     best: Optional[List[Prim]] = None
     best_cost = float('inf')
     for direction in (-1, 1):
-        prims = solve_parallel(start, radius, max_arc=max_arc, direction=direction)
+        prims = solve_parallel(start, radius, max_arc=max_arc,
+                               direction=direction)
         if prims is None:
             continue
         length = total_length(prims)

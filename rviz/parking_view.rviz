@@ -29,6 +29,8 @@ Visualization Manager:
         Value: /scan
         Reliability Policy: Best Effort
       Size (m): 0.03
+      Style: Points
+      Color Transformer: FlatColor
       Color: 255; 60; 60
     - Class: rviz_default_plugins/PoseArray
       Name: AMCL Particles
@@ -80,6 +82,17 @@ Visualization Manager:
         Durability Policy: Transient Local
       Color: 255; 170; 0
       Line Style: Lines
+    - Class: rviz_default_plugins/Pose
+      Name: Sim True Pose
+      Enabled: true
+      Topic:
+        Value: /sim/true_pose
+      Shape: Arrow
+      Color: 0; 255; 128
+      Shaft Length: 0.3
+      Shaft Radius: 0.03
+      Head Length: 0.12
+      Head Radius: 0.07
     - Class: rviz_default_plugins/Polygon
       Name: Footprint
       Enabled: true

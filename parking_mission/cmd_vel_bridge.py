@@ -57,9 +57,16 @@ class CmdVelBridge(Node):
         self.declare_parameter('cmd_vel_topic', '/cmd_vel')
         self.declare_parameter('motor_topic', '/xycar_motor')
         self.declare_parameter('enable_topic', '/nav_drive_enable')
-        # bringup만 띄우고 RViz로 수동 테스트할 때를 위해 기본은 활성.
-        # 미션 중에는 mission_manager가 구간마다 명시적으로 켜고 끈다.
-        self.declare_parameter('default_enabled', True)
+        # 기본은 **비활성**이다.
+        #
+        # bringup은 '차를 움직일 준비'까지만 하는 단계인데, 기본을 활성으로 뒀더니
+        # bringup만 띄웠는데도 차가 제멋대로 움직이는 일이 생겼다. Nav2가 어떤
+        # 이유로든 /cmd_vel을 한 번 내면 그대로 모터로 나가기 때문이다.
+        #
+        # mission_manager가 이동 구간을 시작할 때 /nav_drive_enable로 켠다.
+        # RViz 2D Goal Pose로 수동 테스트하려면 아래처럼 직접 켜야 한다:
+        #   ros2 topic pub --once /nav_drive_enable std_msgs/msg/Bool "{data: true}"
+        self.declare_parameter('default_enabled', False)
 
         self.wheelbase = float(self.get_parameter('wheelbase').value)
         self.angle_limit = float(self.get_parameter('angle_limit').value)
